@@ -8,6 +8,7 @@ import logging
 import os
 import glob
 import re
+import shlex
 import shutil
 import asyncio
 from datetime import datetime
@@ -18,7 +19,10 @@ from zipfile import ZipFile
 from typing import (
     TYPE_CHECKING,
     Dict,
-    Any
+    Any,
+    Callable,
+    Optional,
+    List
 )
 if TYPE_CHECKING:
     from confighelper import ConfigHelper
@@ -31,6 +35,627 @@ if TYPE_CHECKING:
     APIComp = klippy_apis.KlippyAPI
     SCMDComp = shell_command.ShellCommandFactory
     DBComp = database.MoonrakerDatabase
+
+
+class TimelapseGcodeService:
+
+    def __init__(self, owner: Timelapse) -> None:
+        self.owner = owner
+
+    async def setgcodevariables(self) -> None:
+        gcommand = "_SET_TIMELAPSE_SETUP " \
+            + f" ENABLE={self.owner.config['enabled']}" \
+            + f" VERBOSE={self.owner.config['gcode_verbose']}" \
+            + f" PARK_ENABLE={self.owner.config['parkhead']}" \
+            + f" PARK_POS={self.owner.config['parkpos']}" \
+            + f" CUSTOM_POS_X={self.owner.config['park_custom_pos_x']}" \
+            + f" CUSTOM_POS_Y={self.owner.config['park_custom_pos_y']}" \
+            + f" CUSTOM_POS_DZ={self.owner.config['park_custom_pos_dz']}" \
+            + f" TRAVEL_SPEED={self.owner.config['park_travel_speed']}" \
+            + f" RETRACT_SPEED={self.owner.config['park_retract_speed']}" \
+            + f" EXTRUDE_SPEED={self.owner.config['park_extrude_speed']}" \
+            + " RETRACT_DISTANCE=" \
+            + f"{self.owner.config['park_retract_distance']}" \
+            + " EXTRUDE_DISTANCE=" \
+            + f"{self.owner.config['park_extrude_distance']}" \
+            + f" PARK_TIME={self.owner.config['park_time']}" \
+            + f" FW_RETRACT={self.owner.config['fw_retract']}" \
+
+        logging.debug(f"run gcommand: {gcommand}")
+        try:
+            await self.owner.klippy_apis.run_gcode(gcommand)
+        except self.owner.server.error:
+            msg = f"Error executing GCode {gcommand}"
+            logging.exception(msg)
+
+    async def release_parkedhead(self) -> None:
+        gcommand = "SET_GCODE_VARIABLE " \
+            + "MACRO=TIMELAPSE_TAKE_FRAME " \
+            + "VARIABLE=takingframe VALUE=False"
+
+        logging.debug(f"run gcommand: {gcommand}")
+        try:
+            await self.owner.klippy_apis.run_gcode(gcommand)
+        except self.owner.server.error:
+            msg = f"Error executing GCode {gcommand}"
+            logging.exception(msg)
+
+    async def start_hyperlapse(self) -> None:
+        hyperlapse_cycle = self.owner.config['hyperlapse_cycle']
+        park_time = self.owner.config['park_time']
+        timediff = hyperlapse_cycle - park_time
+        if timediff >= 1:
+            gcommand = "HYPERLAPSE ACTION=START" \
+                       + f" CYCLE={hyperlapse_cycle}"
+
+            logging.debug(f"run gcommand: {gcommand}")
+            try:
+                await self.owner.klippy_apis.run_gcode(gcommand)
+            except self.owner.server.error:
+                msg = f"Error executing GCode {gcommand}"
+                logging.exception(msg)
+            self.owner.hyperlapserunning = True
+        else:
+            logging.info("WARNING: Blocked start of Hyperlapse, because "
+                         f"hyperlapse_cycle ({hyperlapse_cycle}s) is smaller "
+                         f"then or to close to park_time ({park_time}s)"
+                         )
+
+    async def stop_hyperlapse(self) -> None:
+        gcommand = "HYPERLAPSE ACTION=STOP"
+
+        logging.debug(f"run gcommand: {gcommand}")
+        try:
+            await self.owner.klippy_apis.run_gcode(gcommand)
+        except self.owner.server.error:
+            msg = f"Error executing GCode {gcommand}"
+            logging.exception(msg)
+        self.owner.hyperlapserunning = False
+
+
+class TimelapseFrameService:
+
+    def __init__(self, owner: Timelapse) -> None:
+        self.owner = owner
+
+    def seed_framecount(self) -> int:
+        highest_frame = 0
+        for frame_path in glob.glob(self.owner.temp_dir + "frame*.jpg"):
+            frame_name = os.path.basename(frame_path)
+            match = re.fullmatch(r"frame(\d+)\.jpg", frame_name)
+            if match:
+                highest_frame = max(highest_frame, int(match.group(1)))
+        return highest_frame
+
+    async def newframe(self) -> None:
+        # make sure webcamconfig is uptodate before grabbing a new frame
+        await self.owner.getWebcamConfig()
+
+        options = ""
+        if self.owner.wget_skip_cert:
+            options += "--no-check-certificate "
+
+        self.owner.framecount += 1
+        framefile = "frame" + str(self.owner.framecount).zfill(6) + ".jpg"
+        output_path = self.owner.temp_dir + framefile
+        cmd = "wget " + options \
+            + shlex.quote(self.owner.config['snapshoturl']) \
+            + " -O " + shlex.quote(output_path)
+        self.owner.lastframefile = framefile
+        logging.debug(f"cmd: {cmd}")
+
+        shell_cmd: SCMDComp = self.owner.server.lookup_component(
+            'shell_command')
+        scmd = shell_cmd.build_shell_command(cmd, None)
+        cmdstatus = False
+        try:
+            cmdstatus = await scmd.run(timeout=self.owner.wget_timeout,
+                                       verbose=False)
+        except Exception:
+            logging.exception(f"Error running cmd '{cmd}'")
+
+        result = {'action': 'newframe'}
+        if cmdstatus:
+            result.update({
+                'frame': str(self.owner.framecount),
+                'framefile': framefile,
+                'status': 'success'
+            })
+        else:
+            logging.info(f"getting newframe failed: {cmd}")
+            self.owner.framecount -= 1
+            result.update({'status': 'error'})
+
+        self.owner.notify_event(result)
+        self.owner.takingframe = False
+
+    def cleanup(self) -> None:
+        logging.debug("cleanup frame directory")
+        filelist = glob.glob(self.owner.temp_dir + "frame*.jpg")
+        if filelist:
+            for filepath in filelist:
+                os.remove(filepath)
+        self.owner.framecount = 0
+        self.owner.lastframefile = ""
+
+    async def save_frames_zip(self, webrequest=None):
+        filelist = sorted(glob.glob(self.owner.temp_dir + "frame*.jpg"))
+        self.owner.framecount = len(filelist)
+        result = {'action': 'saveframes'}
+
+        if not filelist:
+            msg = "no frames to save, skip"
+            status = "skipped"
+        elif self.owner.saveisrunning:
+            msg = "saving frames already"
+            status = "running"
+        else:
+            self.owner.saveisrunning = True
+
+            # get printed filename
+            kresult = await self.owner.klippy_apis.query_objects(
+                {'print_stats': None})
+            pstats = kresult.get("print_stats", {})
+            gcodefilename = pstats.get("filename", "").split("/")[-1]
+
+            # prepare output filename
+            now = datetime.now()
+            date_time = now.strftime(self.owner.config['time_format_code'])
+            outfile = f"timelapse_{gcodefilename}_{date_time}"
+            outfileFull = outfile + "_frames.zip"
+
+            with ZipFile(self.owner.out_dir + outfileFull, "w") as zipObj:
+                for frame in filelist:
+                    zipObj.write(frame, frame.split("/")[-1])
+
+            logging.info(f"saved frames: {outfile}_frames.zip")
+
+            result.update({
+                'status': 'finished',
+                'zipfile': outfileFull
+            })
+
+            self.owner.saveisrunning = False
+
+        return result
+
+
+class TimelapseRenderService:
+
+    def __init__(self, owner: Timelapse) -> None:
+        self.owner = owner
+
+    def _build_render_filter_param(self) -> str:
+        filterParam = ""
+        rotation = self.owner.config['rotation']
+        flip_x = self.owner.config['flip_x']
+        flip_y = self.owner.config['flip_y']
+        if rotation == 90 and flip_y:
+            filterParam = " -vf 'transpose=3'"
+        elif rotation == 90:
+            filterParam = " -vf 'transpose=1'"
+        elif rotation == 180:
+            filterParam = " -vf 'hflip,vflip'"
+        elif rotation == 270 and flip_y:
+            filterParam = " -vf 'transpose=0'"
+        elif rotation == 270:
+            filterParam = " -vf 'transpose=2'"
+        elif rotation > 0:
+            pi = 3.141592653589793
+            rot = str(rotation*(pi/180))
+            filterParam = " -vf 'rotate=" + rot + "'"
+        elif flip_x and flip_y:
+            filterParam = " -vf 'hflip,vflip'"
+        elif flip_x:
+            filterParam = " -vf 'hflip'"
+        elif flip_y:
+            filterParam = " -vf 'vflip'"
+        return filterParam
+
+    def _build_ffmpeg_video_cmd(self,
+                                fps: int,
+                                inputfiles: str,
+                                filter_param: str,
+                                output_path: str
+                                ) -> str:
+        return self.owner.ffmpeg_binary_path \
+            + " -r " + str(fps) \
+            + " -i '" + inputfiles + "'" \
+            + filter_param \
+            + " -threads 2 -g 5" \
+            + " -crf " + str(self.owner.config['constant_rate_factor']) \
+            + " -vcodec libx264" \
+            + " -pix_fmt " + self.owner.config['pixelformat'] \
+            + " -an" \
+            + " " + self.owner.config['extraoutputparams'] \
+            + " '" + output_path + "' -y"
+
+    def _build_ffmpeg_preview_cmd(self,
+                                  preview_file_path: str,
+                                  filter_param: str
+                                  ) -> str:
+        return self.owner.ffmpeg_binary_path \
+            + " -i '" + preview_file_path + "'" \
+            + filter_param \
+            + " -an" \
+            + " " + self.owner.config['extraoutputparams'] \
+            + " '" + preview_file_path + "' -y"
+
+    async def _run_ffmpeg_cmd(self,
+                              cmd: str,
+                              cb: Optional[Callable] = None,
+                              verbose: bool = True,
+                              log_complete: bool = False,
+                              timeout: float = 9999999999,
+                              ) -> bool:
+        shell_cmd: SCMDComp = self.owner.server.lookup_component(
+            'shell_command')
+        scmd = shell_cmd.build_shell_command(cmd, cb)
+        try:
+            return await scmd.run(verbose=verbose,
+                                  log_complete=log_complete,
+                                  timeout=timeout,
+                                  )
+        except Exception:
+            logging.exception(f"Error running cmd '{cmd}'")
+            return False
+
+    async def render(self, webrequest=None):
+        filelist = sorted(glob.glob(self.owner.temp_dir + "frame*.jpg"))
+        self.owner.framecount = len(filelist)
+        result = {'action': 'render'}
+
+        # make sure webcamconfig is uptodate for the rotation/flip feature
+        await self.owner.getWebcamConfig()
+
+        if not filelist:
+            msg = "no frames to render, skip"
+            status = "skipped"
+        elif self.owner.renderisrunning:
+            msg = "render is already running"
+            status = "running"
+        elif not self.owner.ffmpeg_installed:
+            msg = (f"{self.owner.ffmpeg_binary_path} not found, "
+                   "please install ffmpeg")
+            status = "error"
+            logging.info(f"timelapse: {msg}")
+        else:
+            self.owner.renderisrunning = True
+
+            # get printed filename
+            kresult = await self.owner.klippy_apis.query_objects(
+                {'print_stats': None})
+            pstats = kresult.get("print_stats", {})
+            gcodefilename = pstats.get("filename", "").split("/")[-1]
+
+            # prepare output filename
+            now = datetime.now()
+            date_time = now.strftime(self.owner.config['time_format_code'])
+            inputfiles = self.owner.temp_dir + "frame%6d.jpg"
+            outfile = f"timelapse_{gcodefilename}_{date_time}"
+            output_path = self.owner.temp_dir + outfile + ".mp4"
+
+            # dublicate last frame
+            duplicates: List[str] = []
+            if self.owner.config['duplicatelastframe'] > 0:
+                lastframe = filelist[-1:][0]
+
+                for i in range(self.owner.config['duplicatelastframe']):
+                    nextframe = str(self.owner.framecount + i + 1).zfill(6)
+                    duplicate = "frame" + nextframe + ".jpg"
+                    duplicatePath = self.owner.temp_dir + duplicate
+                    duplicates.append(duplicatePath)
+                    try:
+                        shutil.copy(lastframe, duplicatePath)
+                    except OSError as err:
+                        logging.info(f"duplicating last frame failed: {err}")
+
+                filelist = sorted(
+                    glob.glob(self.owner.temp_dir + "frame*.jpg"))
+                self.owner.framecount = len(filelist)
+
+            # variable framerate
+            if self.owner.config['variable_fps']:
+                fps = int(self.owner.framecount /
+                          self.owner.config['targetlength'])
+                fps = max(min(fps,
+                              self.owner.config['variable_fps_max']),
+                          self.owner.config['variable_fps_min'])
+            else:
+                fps = self.owner.config['output_framerate']
+
+            filterParam = self._build_render_filter_param()
+            cmd = self._build_ffmpeg_video_cmd(
+                fps, inputfiles, filterParam, output_path)
+
+            logging.info(f"start FFMPEG: {cmd}")
+            self.owner.lastrenderprogress = 0
+            self.owner.lastcmdreponse = ""
+            result.update({
+                'status': 'started',
+                'framecount': str(self.owner.framecount),
+                'settings': {
+                    'framerate': fps,
+                    'crf': self.owner.config['constant_rate_factor'],
+                    'pixelformat': self.owner.config['pixelformat']
+                }
+            })
+
+            self.owner.notify_event(result)
+            cmdstatus = await self._run_ffmpeg_cmd(cmd, self.ffmpeg_cb)
+
+            if cmdstatus:
+                status = "success"
+                msg = f"Rendering Video successful: {outfile}.mp4"
+                result.update({
+                    'filename': f"{outfile}.mp4",
+                    'printfile': gcodefilename
+                })
+                result.pop("settings")
+
+                try:
+                    shutil.move(output_path,
+                                self.owner.out_dir + outfile + ".mp4")
+                except OSError as err:
+                    logging.info(f"moving output file failed: {err}")
+
+                if self.owner.config['previewimage']:
+                    previewFile = f"{outfile}.jpg"
+                    previewFilePath = self.owner.out_dir + previewFile
+                    previewSrc = filelist[-1:][0]
+                    try:
+                        shutil.copy(previewSrc, previewFilePath)
+                    except OSError as err:
+                        logging.info(f"copying preview image failed: {err}")
+                    else:
+                        result.update({'previewimage': previewFile})
+
+                    if filterParam or self.owner.config['extraoutputparams']:
+                        cmd = self._build_ffmpeg_preview_cmd(previewFilePath,
+                                                             filterParam)
+                        logging.info(f"Rotate preview image cmd: {cmd}")
+                        await self._run_ffmpeg_cmd(cmd)
+
+            else:
+                status = "error"
+                msg = (f"Rendering Video failed: {cmd} : "
+                       f"{self.owner.lastcmdreponse}")
+                result.update({
+                    'cmd': cmd,
+                    'cmdresponse': self.owner.lastcmdreponse
+                })
+
+            self.owner.renderisrunning = False
+
+            if duplicates:
+                for dupe in duplicates:
+                    try:
+                        os.remove(dupe)
+                    except OSError as err:
+                        logging.info(f"remove duplicate failed: {err}")
+
+        logging.info(msg)
+        result.update({
+            'status': status,
+            'msg': msg
+        })
+        self.owner.notify_event(result)
+
+        if self.owner.byrendermacro:
+            gcommand = "SET_GCODE_VARIABLE " \
+                       + "MACRO=TIMELAPSE_RENDER VARIABLE=render VALUE=False"
+            logging.debug(f"run gcommand: {gcommand}")
+            try:
+                await self.owner.klippy_apis.run_gcode(gcommand)
+            except self.owner.server.error:
+                msg = f"Error executing GCode {gcommand}"
+                logging.exception(msg)
+            self.owner.byrendermacro = False
+
+        return result
+
+    def ffmpeg_cb(self, response):
+        self.owner.lastcmdreponse = response.decode("utf-8")
+        try:
+            frame = re.search(
+                r'(?<=frame=)*(\d+)(?=.+fps)', self.owner.lastcmdreponse
+            ).group()
+        except AttributeError:
+            return
+        percent = int(frame) / self.owner.framecount * 100
+        if percent > 100:
+            percent = 100
+
+        if self.owner.lastrenderprogress != int(percent):
+            self.owner.lastrenderprogress = int(percent)
+            result = {
+                'action': 'render',
+                'status': 'running',
+                'progress': self.owner.lastrenderprogress
+            }
+            self.owner.notify_event(result)
+
+
+class TimelapseConfigService:
+
+    def __init__(self, owner: Timelapse) -> None:
+        self.owner = owner
+
+    def overwrite_dbconfig_with_confighelper(self) -> None:
+        blockedsettings = []
+
+        for config in self.owner.confighelper.get_options():
+            if config in self.owner.config:
+                configtype = type(self.owner.config[config])
+                if configtype == str:
+                    self.owner.config[config] = self.owner.confighelper.get(
+                        config)
+                elif configtype == bool:
+                    self.owner.config[config] = \
+                        self.owner.confighelper.getboolean(config)
+                elif configtype == int:
+                    self.owner.config[config] = self.owner.confighelper.getint(
+                        config)
+                elif configtype == float:
+                    self.owner.config[config] = \
+                        self.owner.confighelper.getfloat(config)
+
+                blockedsettings.append(config)
+
+        self.owner.config.update({'blockedsettings': blockedsettings})
+        logging.debug(
+            f"blockedsettings {self.owner.config['blockedsettings']}")
+
+    async def get_webcam_config(self) -> None:
+        webcam_name = self.owner.config['camera']
+        try:
+            wcmgr: WebcamManager = self.owner.server.lookup_component("webcam")
+            cams = wcmgr.get_webcams()
+
+            if not cams:
+                logging.info("WARNING: no camera configured, " +
+                             "using the fallback config")
+                fallback = {'snapshot_url': self.owner.config['snapshoturl'],
+                            'rotation': self.owner.config['rotation'],
+                            'flip_horizontal': self.owner.config['flip_x'],
+                            'flip_vertical': self.owner.config['flip_y']
+                            }
+                self.parse_webcam_config(fallback)
+                return
+
+            if webcam_name and webcam_name in cams:
+                camera = cams[webcam_name]
+            else:
+                camera = list(cams.values())[0]
+
+            self.parse_webcam_config(camera.as_dict())
+
+        except Exception as e:
+            logging.info(f"something went wrong getting"
+                         f"Cam Camera:{webcam_name} from Database. "
+                         f"Exception: {e}"
+                         )
+
+    def parse_webcam_config(self, webcamconfig) -> None:
+        snapshoturl = webcamconfig['snapshot_url']
+        flip_x = webcamconfig['flip_horizontal']
+        flip_y = webcamconfig['flip_vertical']
+        rotation = webcamconfig['rotation']
+
+        oldWebcamConfig = {"url": self.owner.config['snapshoturl'],
+                           "flip_x": self.owner.config['flip_x'],
+                           "flip_y": self.owner.config['flip_y'],
+                           "rotation": self.owner.config['rotation']
+                           }
+
+        self.owner.config['snapshoturl'] = self.owner.confighelper.get(
+            'snapshoturl', snapshoturl)
+        self.owner.config['flip_x'] = self.owner.confighelper.getboolean(
+            'flip_x', flip_x)
+        self.owner.config['flip_y'] = self.owner.confighelper.getboolean(
+            'flip_y', flip_y)
+        self.owner.config['rotation'] = self.owner.confighelper.getint(
+            'rotation', rotation)
+
+        if not self.owner.config['snapshoturl'].startswith('http'):
+            if not self.owner.config['snapshoturl'].startswith('/'):
+                self.owner.config['snapshoturl'] = (
+                    "http://localhost/" + self.owner.config['snapshoturl'])
+            else:
+                self.owner.config['snapshoturl'] = (
+                    "http://localhost" + self.owner.config['snapshoturl'])
+
+        newWebcamConfig = {"url": self.owner.config['snapshoturl'],
+                           "flip_x": self.owner.config['flip_x'],
+                           "flip_y": self.owner.config['flip_y'],
+                           "rotation": self.owner.config['rotation']
+                           }
+
+        if not oldWebcamConfig == newWebcamConfig:
+            logging.info("snapshoturl: "
+                         f"{self.owner.config['snapshoturl']}, "
+                         f"Flip V/H: {self.owner.config['flip_y']}/"
+                         f"{self.owner.config['flip_y']}, "
+                         f"rotation: {self.owner.config['rotation']}"
+                         )
+
+    async def webrequest_settings(self,
+                                  webrequest: WebRequest
+                                  ) -> Dict[str, Any]:
+        action = webrequest.get_action()
+        if action == 'POST':
+
+            args = webrequest.get_args()
+            logging.debug("webreq_args: " + str(args))
+
+            gcodechange = False
+            settingsWithGcodechange = [
+                'enabled', 'parkhead',
+                'parkpos', 'park_custom_pos_x',
+                'park_custom_pos_y', 'park_custom_pos_dz',
+                'park_travel_speed', 'park_retract_speed',
+                'park_extrude_speed', 'park_retract_distance',
+                'park_extrude_distance', 'park_time', 'fw_retract'
+            ]
+            modechanged = False
+
+            for setting in args:
+                if setting in self.owner.config:
+                    settingtype = type(self.owner.config[setting])
+                    if setting == "snapshoturl":
+                        logging.debug(
+                            "snapshoturl cannot be changed via webrequest")
+                        continue
+                    elif settingtype == str:
+                        settingvalue = webrequest.get(setting)
+                    elif settingtype == bool:
+                        settingvalue = webrequest.get_boolean(setting)
+                    elif settingtype == int:
+                        settingvalue = webrequest.get_int(setting)
+                    elif settingtype == float:
+                        settingvalue = webrequest.get_float(setting)
+
+                    self.owner.config[setting] = settingvalue
+
+                    self.owner.database.insert_item(
+                        "timelapse",
+                        f"config.{setting}",
+                        settingvalue
+                    )
+
+                    if setting == "camera":
+                        if not self.owner.noWebcamDb:
+                            await self.get_webcam_config()
+                        else:
+                            logging.info("Webcam Namespace not intialized, "
+                                         "please restart moonraker service!")
+
+                    if setting in settingsWithGcodechange:
+                        gcodechange = True
+
+                    if setting == "mode":
+                        modechanged = True
+
+                    logging.debug(f"changed setting: {setting} "
+                                  f"value: {settingvalue} "
+                                  f"type: {settingtype}"
+                                  )
+
+            if modechanged:
+                if self.owner.config['mode'] == "hyperlapse":
+                    if not self.owner.hyperlapserunning:
+                        if self.owner.printing:
+                            ioloop = IOLoop.current()
+                            ioloop.spawn_callback(self.owner.start_hyperlapse)
+                else:
+                    if self.owner.hyperlapserunning:
+                        ioloop = IOLoop.current()
+                        ioloop.spawn_callback(self.owner.stop_hyperlapse)
+            if gcodechange:
+                ioloop = IOLoop.current()
+                ioloop.spawn_callback(self.owner.setgcodevariables)
+
+        return self.owner.config
 
 
 class Timelapse:
@@ -64,6 +689,7 @@ class Timelapse:
             "ffmpeg_binary_path", "/usr/bin/ffmpeg")
         self.wget_skip_cert = confighelper.getboolean(
             "wget_skip_cert_check", False)
+        self.wget_timeout = confighelper.getfloat("wget_timeout", 2.0)
 
         # Setup default config
         self.config: Dict[str, Any] = {
@@ -113,6 +739,9 @@ class Timelapse:
         else:
             self.config.update(dbconfig)
 
+        # setup internal config service
+        self.config_service = TimelapseConfigService(self)
+
         # Overwrite Config with fixed config made in moonraker.conf
         # this is a fallback to older setups and when the Frontend doesn't
         # support the settings endpoint
@@ -135,6 +764,12 @@ class Timelapse:
         # create directories if they doesn't exist
         os.makedirs(self.temp_dir, exist_ok=True)
         os.makedirs(self.out_dir, exist_ok=True)
+
+        # setup internal services
+        self.gcode_service = TimelapseGcodeService(self)
+        self.frame_service = TimelapseFrameService(self)
+        self.render_service = TimelapseRenderService(self)
+        self.framecount = self.frame_service.seed_framecount()
 
         # setup eventhandlers and endpoints
         file_manager = self.server.lookup_component("file_manager")
@@ -171,105 +806,13 @@ class Timelapse:
         await self.getWebcamConfig()
 
     def overwriteDbconfigWithConfighelper(self) -> None:
-        blockedsettings = []
-
-        for config in self.confighelper.get_options():
-            if config in self.config:
-                configtype = type(self.config[config])
-                if configtype == str:
-                    self.config[config] = self.confighelper.get(config)
-                elif configtype == bool:
-                    self.config[config] = self.confighelper.getboolean(config)
-                elif configtype == int:
-                    self.config[config] = self.confighelper.getint(config)
-                elif configtype == float:
-                    self.config[config] = self.confighelper.getfloat(config)
-
-                # add the config to list of blockedsettings
-                blockedsettings.append(config)
-
-        # append the list of blockedsettings to the config dict
-        self.config.update({'blockedsettings': blockedsettings})
-        logging.debug(f"blockedsettings {self.config['blockedsettings']}")
+        self.config_service.overwrite_dbconfig_with_confighelper()
 
     async def getWebcamConfig(self) -> None:
-        # Read Webcam config from Database
-        webcam_name = self.config['camera']
-        try:
-            wcmgr: WebcamManager = self.server.lookup_component("webcam")
-            cams = wcmgr.get_webcams()
-
-            if not cams:
-                logging.info("WARNING: no camera configured, " +
-                             "using the fallback config")
-                fallback = {'snapshot_url': self.config['snapshoturl'],
-                            'rotation': self.config['rotation'],
-                            'flip_horizontal': self.config['flip_x'],
-                            'flip_vertical': self.config['flip_y']
-                            }
-                self.parseWebcamConfig(fallback)
-                return
-
-            if webcam_name and webcam_name in cams:
-                camera = cams[webcam_name]
-            else:
-                camera = list(cams.values())[0]
-
-            self.parseWebcamConfig(camera.as_dict())
-
-        except Exception as e:
-            logging.info(f"something went wrong getting"
-                         f"Cam Camera:{webcam_name} from Database. "
-                         f"Exception: {e}"
-                         )
+        await self.config_service.get_webcam_config()
 
     def parseWebcamConfig(self, webcamconfig) -> None:
-        snapshoturl = webcamconfig['snapshot_url']
-        flip_x = webcamconfig['flip_horizontal']
-        flip_y = webcamconfig['flip_vertical']
-        rotation = webcamconfig['rotation']
-
-        oldWebcamConfig = {"url": self.config['snapshoturl'],
-                           "flip_x": self.config['flip_x'],
-                           "flip_y": self.config['flip_y'],
-                           "rotation": self.config['rotation']
-                           }
-
-        self.config['snapshoturl'] = self.confighelper.get('snapshoturl',
-                                                           snapshoturl
-                                                           )
-        self.config['flip_x'] = self.confighelper.getboolean('flip_x',
-                                                             flip_x
-                                                             )
-        self.config['flip_y'] = self.confighelper.getboolean('flip_y',
-                                                             flip_y
-                                                             )
-        self.config['rotation'] = self.confighelper.getint('rotation',
-                                                           rotation
-                                                           )
-
-        if not self.config['snapshoturl'].startswith('http'):
-            if not self.config['snapshoturl'].startswith('/'):
-                self.config['snapshoturl'] = "http://localhost/" + \
-                                             self.config['snapshoturl']
-            else:
-                self.config['snapshoturl'] = "http://localhost" + \
-                                             self.config['snapshoturl']
-
-        # check if settings have changed and if so creat log entry
-        newWebcamConfig = {"url": self.config['snapshoturl'],
-                           "flip_x": self.config['flip_x'],
-                           "flip_y": self.config['flip_y'],
-                           "rotation": self.config['rotation']
-                           }
-
-        if not oldWebcamConfig == newWebcamConfig:
-            logging.info("snapshoturl: "
-                         f"{self.config['snapshoturl']}, "
-                         f"Flip V/H: {self.config['flip_y']}/"
-                         f"{self.config['flip_y']}, "
-                         f"rotation: {self.config['rotation']}"
-                         )
+        self.config_service.parse_webcam_config(webcamconfig)
 
     async def webrequest_lastframeinfo(self,
                                        webrequest: WebRequest
@@ -282,79 +825,7 @@ class Timelapse:
     async def webrequest_settings(self,
                                   webrequest: WebRequest
                                   ) -> Dict[str, Any]:
-        action = webrequest.get_action()
-        if action == 'POST':
-
-            args = webrequest.get_args()
-            logging.debug("webreq_args: " + str(args))
-
-            gcodechange = False
-            settingsWithGcodechange = [
-                'enabled', 'parkhead',
-                'parkpos', 'park_custom_pos_x',
-                'park_custom_pos_y', 'park_custom_pos_dz',
-                'park_travel_speed', 'park_retract_speed',
-                'park_extrude_speed', 'park_retract_distance',
-                'park_extrude_distance', 'park_time', 'fw_retract'
-            ]
-            modechanged = False
-
-            for setting in args:
-                if setting in self.config:
-                    settingtype = type(self.config[setting])
-                    if setting == "snapshoturl":
-                        logging.debug(
-                            "snapshoturl cannot be changed via webrequest")
-                    elif settingtype == str:
-                        settingvalue = webrequest.get(setting)
-                    elif settingtype == bool:
-                        settingvalue = webrequest.get_boolean(setting)
-                    elif settingtype == int:
-                        settingvalue = webrequest.get_int(setting)
-                    elif settingtype == float:
-                        settingvalue = webrequest.get_float(setting)
-
-                    self.config[setting] = settingvalue
-
-                    self.database.insert_item(
-                        "timelapse",
-                        f"config.{setting}",
-                        settingvalue
-                    )
-
-                    if setting == "camera":
-                        if not self.noWebcamDb:
-                            await self.getWebcamConfig()
-                        else:
-                            logging.info("Webcam Namespace not intialized, "
-                                         "please restart moonraker service!")
-
-                    if setting in settingsWithGcodechange:
-                        gcodechange = True
-
-                    if setting == "mode":
-                        modechanged = True
-
-                    logging.debug(f"changed setting: {setting} "
-                                  f"value: {settingvalue} "
-                                  f"type: {settingtype}"
-                                  )
-
-            if modechanged:
-                if self.config['mode'] == "hyperlapse":
-                    if not self.hyperlapserunning:
-                        if self.printing:
-                            ioloop = IOLoop.current()
-                            ioloop.spawn_callback(self.start_hyperlapse)
-                else:
-                    if self.hyperlapserunning:
-                        ioloop = IOLoop.current()
-                        ioloop.spawn_callback(self.stop_hyperlapse)
-            if gcodechange:
-                ioloop = IOLoop.current()
-                ioloop.spawn_callback(self.setgcodevariables)
-
-        return self.config
+        return await self.config_service.webrequest_settings(webrequest)
 
     async def handle_klippy_ready(self) -> None:
         ioloop = IOLoop.current()
@@ -364,28 +835,7 @@ class Timelapse:
         ioloop.spawn_callback(self.stop_hyperlapse)
 
     async def setgcodevariables(self) -> None:
-        gcommand = "_SET_TIMELAPSE_SETUP " \
-            + f" ENABLE={self.config['enabled']}" \
-            + f" VERBOSE={self.config['gcode_verbose']}" \
-            + f" PARK_ENABLE={self.config['parkhead']}" \
-            + f" PARK_POS={self.config['parkpos']}" \
-            + f" CUSTOM_POS_X={self.config['park_custom_pos_x']}" \
-            + f" CUSTOM_POS_Y={self.config['park_custom_pos_y']}" \
-            + f" CUSTOM_POS_DZ={self.config['park_custom_pos_dz']}" \
-            + f" TRAVEL_SPEED={self.config['park_travel_speed']}" \
-            + f" RETRACT_SPEED={self.config['park_retract_speed']}" \
-            + f" EXTRUDE_SPEED={self.config['park_extrude_speed']}" \
-            + f" RETRACT_DISTANCE={self.config['park_retract_distance']}" \
-            + f" EXTRUDE_DISTANCE={self.config['park_extrude_distance']}" \
-            + f" PARK_TIME={self.config['park_time']}" \
-            + f" FW_RETRACT={self.config['fw_retract']}" \
-
-        logging.debug(f"run gcommand: {gcommand}")
-        try:
-            await self.klippy_apis.run_gcode(gcommand)
-        except self.server.error:
-            msg = f"Error executing GCode {gcommand}"
-            logging.exception(msg)
+        await self.gcode_service.setgcodevariables()
 
     def call_newframe(self, macropark=False, hyperlapse=False) -> None:
         if self.config['enabled']:
@@ -417,85 +867,16 @@ class Timelapse:
         ioloop.call_later(delay=stream_delay, callback=self.newframe)
 
     async def release_parkedhead(self) -> None:
-        gcommand = "SET_GCODE_VARIABLE " \
-            + "MACRO=TIMELAPSE_TAKE_FRAME " \
-            + "VARIABLE=takingframe VALUE=False"
-
-        logging.debug(f"run gcommand: {gcommand}")
-        try:
-            await self.klippy_apis.run_gcode(gcommand)
-        except self.server.error:
-            msg = f"Error executing GCode {gcommand}"
-            logging.exception(msg)
+        await self.gcode_service.release_parkedhead()
 
     async def start_hyperlapse(self) -> None:
-        hyperlapse_cycle = self.config['hyperlapse_cycle']
-        park_time = self.config['park_time']
-        timediff = hyperlapse_cycle - park_time
-        if timediff >= 1:
-            gcommand = "HYPERLAPSE ACTION=START" \
-                       + f" CYCLE={hyperlapse_cycle}"
-
-            logging.debug(f"run gcommand: {gcommand}")
-            try:
-                await self.klippy_apis.run_gcode(gcommand)
-            except self.server.error:
-                msg = f"Error executing GCode {gcommand}"
-                logging.exception(msg)
-            self.hyperlapserunning = True
-        else:
-            logging.info("WARNING: Blocked start of Hyperlapse, because "
-                         f"hyperlapse_cycle ({hyperlapse_cycle}s) is smaller "
-                         f"then or to close to park_time ({park_time}s)"
-                         )
+        await self.gcode_service.start_hyperlapse()
 
     async def stop_hyperlapse(self) -> None:
-        gcommand = "HYPERLAPSE ACTION=STOP"
-
-        logging.debug(f"run gcommand: {gcommand}")
-        try:
-            await self.klippy_apis.run_gcode(gcommand)
-        except self.server.error:
-            msg = f"Error executing GCode {gcommand}"
-            logging.exception(msg)
-        self.hyperlapserunning = False
+        await self.gcode_service.stop_hyperlapse()
 
     async def newframe(self) -> None:
-        # make sure webcamconfig is uptodate before grabbing a new frame
-        await self.getWebcamConfig()
-
-        options = ""
-        if self.wget_skip_cert:
-            options += "--no-check-certificate "
-
-        self.framecount += 1
-        framefile = "frame" + str(self.framecount).zfill(6) + ".jpg"
-        cmd = "wget " + options + self.config['snapshoturl'] \
-              + " -O " + self.temp_dir + framefile
-        self.lastframefile = framefile
-        logging.debug(f"cmd: {cmd}")
-
-        shell_cmd: SCMDComp = self.server.lookup_component('shell_command')
-        scmd = shell_cmd.build_shell_command(cmd, None)
-        try:
-            cmdstatus = await scmd.run(timeout=2., verbose=False)
-        except Exception:
-            logging.exception(f"Error running cmd '{cmd}'")
-
-        result = {'action': 'newframe'}
-        if cmdstatus:
-            result.update({
-                'frame': str(self.framecount),
-                'framefile': framefile,
-                'status': 'success'
-            })
-        else:
-            logging.info(f"getting newframe failed: {cmd}")
-            self.framecount -= 1
-            result.update({'status': 'error'})
-
-        self.notify_event(result)
-        self.takingframe = False
+        await self.frame_service.newframe()
 
     async def handle_status_update(self, status: Dict[str, Any]) -> None:
         if 'print_stats' in status:
@@ -536,59 +917,14 @@ class Timelapse:
                     ioloop.spawn_callback(self.render)
 
     def cleanup(self) -> None:
-        logging.debug("cleanup frame directory")
-        filelist = glob.glob(self.temp_dir + "frame*.jpg")
-        if filelist:
-            for filepath in filelist:
-                os.remove(filepath)
-        self.framecount = 0
-        self.lastframefile = ""
+        self.frame_service.cleanup()
 
     def call_saveFramesZip(self) -> None:
         ioloop = IOLoop.current()
         ioloop.spawn_callback(self.saveFramesZip)
 
     async def saveFramesZip(self, webrequest=None):
-        filelist = sorted(glob.glob(self.temp_dir + "frame*.jpg"))
-        self.framecount = len(filelist)
-        result = {'action': 'saveframes'}
-
-        if not filelist:
-            msg = "no frames to save, skip"
-            status = "skipped"
-        elif self.saveisrunning:
-            msg = "saving frames already"
-            status = "running"
-        else:
-            self.saveisrunning = True
-
-            # get printed filename
-            kresult = await self.klippy_apis.query_objects(
-                {'print_stats': None})
-            pstats = kresult.get("print_stats", {})
-            gcodefilename = pstats.get("filename", "").split("/")[-1]
-
-            # prepare output filename
-            now = datetime.now()
-            date_time = now.strftime(self.config['time_format_code'])
-            outfile = f"timelapse_{gcodefilename}_{date_time}"
-            outfileFull = outfile + "_frames.zip"
-
-            zipObj = ZipFile(self.out_dir + outfileFull, "w")
-
-            for frame in filelist:
-                zipObj.write(frame, frame.split("/")[-1])
-
-            logging.info(f"saved frames: {outfile}_frames.zip")
-
-            result.update({
-                'status': 'finished',
-                'zipfile': outfileFull
-            })
-
-            self.saveisrunning = False
-
-        return result
+        return await self.frame_service.save_frames_zip(webrequest)
 
     def call_render(self, byrendermacro=False) -> None:
         self.byrendermacro = byrendermacro
@@ -596,241 +932,10 @@ class Timelapse:
         ioloop.spawn_callback(self.render)
 
     async def render(self, webrequest=None):
-        filelist = sorted(glob.glob(self.temp_dir + "frame*.jpg"))
-        self.framecount = len(filelist)
-        result = {'action': 'render'}
-
-        # make sure webcamconfig is uptodate for the rotation/flip feature
-        await self.getWebcamConfig()
-
-        if not filelist:
-            msg = "no frames to render, skip"
-            status = "skipped"
-        elif self.renderisrunning:
-            msg = "render is already running"
-            status = "running"
-        elif not self.ffmpeg_installed:
-            msg = f"{self.ffmpeg_binary_path} not found, please install ffmpeg"
-            status = "error"
-            # cmd = outfile = None
-            logging.info(f"timelapse: {msg}")
-        else:
-            self.renderisrunning = True
-
-            # get printed filename
-            kresult = await self.klippy_apis.query_objects(
-                {'print_stats': None})
-            pstats = kresult.get("print_stats", {})
-            gcodefilename = pstats.get("filename", "").split("/")[-1]
-
-            # prepare output filename
-            now = datetime.now()
-            date_time = now.strftime(self.config['time_format_code'])
-            inputfiles = self.temp_dir + "frame%6d.jpg"
-            outfile = f"timelapse_{gcodefilename}_{date_time}"
-
-            # dublicate last frame
-            duplicates = []
-            if self.config['duplicatelastframe'] > 0:
-                lastframe = filelist[-1:][0]
-
-                for i in range(self.config['duplicatelastframe']):
-                    nextframe = str(self.framecount + i + 1).zfill(6)
-                    duplicate = "frame" + nextframe + ".jpg"
-                    duplicatePath = self.temp_dir + duplicate
-                    duplicates.append(duplicatePath)
-                    try:
-                        shutil.copy(lastframe, duplicatePath)
-                    except OSError as err:
-                        logging.info(f"duplicating last frame failed: {err}")
-
-                # update Filelist
-                filelist = sorted(glob.glob(self.temp_dir + "frame*.jpg"))
-                self.framecount = len(filelist)
-
-            # variable framerate
-            if self.config['variable_fps']:
-                fps = int(self.framecount / self.config['targetlength'])
-                fps = max(min(fps,
-                              self.config['variable_fps_max']),
-                          self.config['variable_fps_min'])
-            else:
-                fps = self.config['output_framerate']
-
-            # apply rotation
-            filterParam = ""
-            if self.config['rotation'] == 90 and self.config['flip_y']:
-                filterParam = " -vf 'transpose=3'"
-            elif self.config['rotation'] == 90:
-                filterParam = " -vf 'transpose=1'"
-            elif self.config['rotation'] == 180:
-                filterParam = " -vf 'hflip,vflip'"
-            elif self.config['rotation'] == 270:
-                filterParam = " -vf 'transpose=2'"
-            elif self.config['rotation'] == 270 and self.config['flip_y']:
-                filterParam = " -vf 'transpose=0'"
-            elif self.config['rotation'] > 0:
-                pi = 3.141592653589793
-                rot = str(self.config['rotation']*(pi/180))
-                filterParam = " -vf 'rotate=" + rot + "'"
-            elif self.config['flip_x'] and self.config['flip_y']:
-                filterParam = " -vf 'hflip,vflip'"
-            elif self.config['flip_x']:
-                filterParam = " -vf 'hflip'"
-            elif self.config['flip_y']:
-                filterParam = " -vf 'vflip'"
-
-            # build shell command
-            cmd = self.ffmpeg_binary_path \
-                + " -r " + str(fps) \
-                + " -i '" + inputfiles + "'" \
-                + filterParam \
-                + " -threads 2 -g 5" \
-                + " -crf " + str(self.config['constant_rate_factor']) \
-                + " -vcodec libx264" \
-                + " -pix_fmt " + self.config['pixelformat'] \
-                + " -an" \
-                + " " + self.config['extraoutputparams'] \
-                + " '" + self.temp_dir + outfile + ".mp4' -y"
-
-            # log and notify ws
-            logging.info(f"start FFMPEG: {cmd}")
-            result.update({
-                'status': 'started',
-                'framecount': str(self.framecount),
-                'settings': {
-                    'framerate': fps,
-                    'crf': self.config['constant_rate_factor'],
-                    'pixelformat': self.config['pixelformat']
-                }
-            })
-
-            # run the command
-            shell_cmd: SCMDComp = self.server.lookup_component('shell_command')
-            self.notify_event(result)
-            scmd = shell_cmd.build_shell_command(cmd, self.ffmpeg_cb)
-            try:
-                cmdstatus = await scmd.run(verbose=True,
-                                           log_complete=False,
-                                           timeout=9999999999,
-                                           )
-            except Exception:
-                logging.exception(f"Error running cmd '{cmd}'")
-
-            # check success
-            if cmdstatus:
-                status = "success"
-                msg = f"Rendering Video successful: {outfile}.mp4"
-                result.update({
-                    'filename': f"{outfile}.mp4",
-                    'printfile': gcodefilename
-                })
-                # result.pop("framecount")
-                result.pop("settings")
-
-                # move finished output file to output directory
-                try:
-                    shutil.move(self.temp_dir + outfile + ".mp4",
-                                self.out_dir + outfile + ".mp4")
-                except OSError as err:
-                    logging.info(f"moving output file failed: {err}")
-
-                # copy image preview
-                if self.config['previewimage']:
-                    previewFile = f"{outfile}.jpg"
-                    previewFilePath = self.out_dir + previewFile
-                    previewSrc = filelist[-1:][0]
-                    try:
-                        shutil.copy(previewSrc, previewFilePath)
-                    except OSError as err:
-                        logging.info(f"copying preview image failed: {err}")
-                    else:
-                        result.update({
-                            'previewimage': previewFile
-                        })
-
-                    # apply rotation previewimage if needed
-                    if filterParam or self.config['extraoutputparams']:
-                        cmd = self.ffmpeg_binary_path \
-                            + " -i '" + previewFilePath + "'" \
-                            + filterParam \
-                            + " -an" \
-                            + " " + self.config['extraoutputparams'] \
-                            + " '" + previewFilePath + "' -y"
-
-                        logging.info(f"Rotate preview image cmd: {cmd}")
-
-                        scmd = shell_cmd.build_shell_command(cmd)
-                        try:
-                            cmdstatus = await scmd.run(verbose=True,
-                                                       log_complete=False,
-                                                       timeout=9999999999,
-                                                       )
-                        except Exception:
-                            logging.exception(f"Error running cmd '{cmd}'")
-
-            else:
-                status = "error"
-                msg = f"Rendering Video failed: {cmd} : {self.lastcmdreponse}"
-                result.update({
-                    'cmd': cmd,
-                    'cmdresponse': self.lastcmdreponse
-                })
-
-            self.renderisrunning = False
-
-            # cleanup duplicates
-            if duplicates:
-                for dupe in duplicates:
-                    try:
-                        os.remove(dupe)
-                    except OSError as err:
-                        logging.info(f"remove duplicate failed: {err}")
-
-        # log and notify ws
-        logging.info(msg)
-        result.update({
-            'status': status,
-            'msg': msg
-        })
-        self.notify_event(result)
-
-        # confirm render finish to stop the render macro loop
-        if self.byrendermacro:
-            gcommand = "SET_GCODE_VARIABLE " \
-                       + "MACRO=TIMELAPSE_RENDER VARIABLE=render VALUE=False"
-            logging.debug(f"run gcommand: {gcommand}")
-            try:
-                await self.klippy_apis.run_gcode(gcommand)
-            except self.server.error:
-                msg = f"Error executing GCode {gcommand}"
-                logging.exception(msg)
-            self.byrendermacro = False
-
-        return result
+        return await self.render_service.render(webrequest)
 
     def ffmpeg_cb(self, response):
-        # logging.debug(f"ffmpeg_cb: {response}")
-        self.lastcmdreponse = response.decode("utf-8")
-        try:
-            frame = re.search(
-                r'(?<=frame=)*(\d+)(?=.+fps)', self.lastcmdreponse
-            ).group()
-        except AttributeError:
-            return
-        percent = int(frame) / self.framecount * 100
-        if percent > 100:
-            percent = 100
-
-        if self.lastrenderprogress != int(percent):
-            self.lastrenderprogress = int(percent)
-            # logging.debug(f"ffmpeg Progress: {self.lastrenderprogress}% ")
-            result = {
-                'action': 'render',
-                'status': 'running',
-                'progress': self.lastrenderprogress
-            }
-            self.notify_event(result)
+        self.render_service.ffmpeg_cb(response)
 
     def notify_event(self, result: Dict[str, Any]) -> None:
         logging.debug(f"notify_event: {result}")

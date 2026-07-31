@@ -145,6 +145,10 @@ add additional idle time when parking (Unit seconds, default 0.1)
 #### stream_delay_compensation
 delay frame capture (Unit seconds, default 0.05)
 
+#### wget_timeout
+Maximum time to wait for a snapshot download in seconds. The default is 2.0.
+Increase this for slow cameras or unreliable network connections.
+
 ### Render specific
 
 #### time_format_code
@@ -240,6 +244,7 @@ does.
 #previewimage: True
 #saveframes: False
 #wget_skip_cert_check: False
+#wget_timeout: 2.0
 
 ```
 
