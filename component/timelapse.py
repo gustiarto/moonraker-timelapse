@@ -10,6 +10,7 @@ import glob
 import re
 import shutil
 import asyncio
+import struct
 from datetime import datetime
 from tornado.ioloop import IOLoop
 from zipfile import ZipFile
@@ -28,40 +29,23 @@ if TYPE_CHECKING:
     from . import klippy_apis
     from . import database
 
-    APIComp = klippy_apis.KlippyAPI
-    SCMDComp = shell_command.ShellCommandFactory
-    DBComp = database.MoonrakerDatabase
-
 
 class Timelapse:
-
     def __init__(self, confighelper: ConfigHelper) -> None:
-
-        # setup vars
-        self.renderisrunning = False
-        self.saveisrunning = False
-        self.takingframe = False
-        self.framecount = 0
-        self.lastframefile = ""
-        self.lastrenderprogress = 0
-        self.lastcmdreponse = ""
-        self.byrendermacro = False
-        self.hyperlapserunning = False
-        self.printing = False
-        self.noWebcamDb = False
-
         self.confighelper = confighelper
         self.server = confighelper.get_server()
-        self.klippy_apis: APIComp = self.server.lookup_component('klippy_apis')
-        self.database: DBComp = self.server.lookup_component("database")
+        self.database: database.MoonrakerDatabase = self.server.lookup_component("database")
+        self.klippy_apis: klippy_apis.KlippyAPI = self.server.lookup_component('klippy_apis')
 
-        # setup static (nonDB) settings
-        out_dir_cfg = confighelper.get(
-            "output_path", "~/timelapse/")
-        temp_dir_cfg = confighelper.get(
-            "frame_path", "/tmp/timelapse/")
-        self.ffmpeg_binary_path = confighelper.get(
-            "ffmpeg_binary_path", "/usr/bin/ffmpeg")
+        # check for legacy config path
+        out_dir_cfg = confighelper.get('output_path', '~/timelapse/')
+        temp_dir_cfg = confighelper.get('frame_path', '~/timelapse/frame/')
+
+        # Get FFMPEG binary path
+        self.ffmpeg_binary_path = confighelper.get('ffmpeg_binary_path',
+                                                   '/usr/bin/ffmpeg'
+                                                   )
+
         self.wget_skip_cert = confighelper.getboolean(
             "wget_skip_cert_check", False)
 
@@ -101,7 +85,17 @@ class Timelapse:
             'flip_y': False,
             'duplicatelastframe': 5,
             'previewimage': True,
-            'saveframes': False
+            'saveframes': False,
+            # Cinematic render enhancement options
+            'cinematic_enabled': True,
+            'kenburns_enabled': True,
+            'kenburns_zoom': 1.06,
+            'kenburns_target_x': 50.0,
+            'kenburns_target_y': 50.0,
+            'exposure_stabilization': True,
+            'temporal_interpolation': True,
+            'source_timeline_fps': 10,
+            'cinematic_output_fps': 30
         }
 
         # Get Config from Database and overwrite defaults
@@ -135,6 +129,18 @@ class Timelapse:
         # create directories if they doesn't exist
         os.makedirs(self.temp_dir, exist_ok=True)
         os.makedirs(self.out_dir, exist_ok=True)
+
+        self.framecount = 0
+        self.lastframefile = ""
+        self.renderisrunning = False
+        self.saveisrunning = False
+        self.hyperlapserunning = False
+        self.printing = False
+        self.lastrenderprogress = 0
+        self.lastcmdreponse = ""
+        self.takingframe = False
+        self.byrendermacro = False
+        self.noWebcamDb = False
 
         # setup eventhandlers and endpoints
         file_manager = self.server.lookup_component("file_manager")
@@ -256,7 +262,7 @@ class Timelapse:
                 self.config['snapshoturl'] = "http://localhost" + \
                                              self.config['snapshoturl']
 
-        # check if settings have changed and if so creat log entry
+        # check if settings have changed and if so create log entry
         newWebcamConfig = {"url": self.config['snapshoturl'],
                            "flip_x": self.config['flip_x'],
                            "flip_y": self.config['flip_y'],
@@ -267,7 +273,7 @@ class Timelapse:
             logging.info("snapshoturl: "
                          f"{self.config['snapshoturl']}, "
                          f"Flip V/H: {self.config['flip_y']}/"
-                         f"{self.config['flip_y']}, "
+                         f"{self.config['flip_x']}, "
                          f"rotation: {self.config['rotation']}"
                          )
 
@@ -302,6 +308,7 @@ class Timelapse:
             for setting in args:
                 if setting in self.config:
                     settingtype = type(self.config[setting])
+                    settingvalue: Any = None
                     if setting == "snapshoturl":
                         logging.debug(
                             "snapshoturl cannot be changed via webrequest")
@@ -313,6 +320,14 @@ class Timelapse:
                         settingvalue = webrequest.get_int(setting)
                     elif settingtype == float:
                         settingvalue = webrequest.get_float(setting)
+
+                    # Range validation for Ken Burns parameters
+                    if setting == "kenburns_target_x":
+                        settingvalue = max(0.0, min(100.0, float(settingvalue)))
+                    elif setting == "kenburns_target_y":
+                        settingvalue = max(0.0, min(100.0, float(settingvalue)))
+                    elif setting == "kenburns_zoom":
+                        settingvalue = max(1.0, float(settingvalue))
 
                     self.config[setting] = settingvalue
 
@@ -590,6 +605,19 @@ class Timelapse:
 
         return result
 
+    def get_frame_dimensions(self, filepath: str) -> tuple[int, int]:
+        try:
+            with open(filepath, 'rb') as f:
+                b = f.read(4096)
+                if b[:2] == b'\xff\xd8':
+                    for i in range(len(b) - 8):
+                        if b[i] == 0xFF and b[i+1] in (0xC0, 0xC1, 0xC2, 0xC3):
+                            h, w = struct.unpack('>HH', b[i+5:i+9])
+                            return w, h
+        except Exception as e:
+            logging.debug(f"get_frame_dimensions error: {e}")
+        return 1920, 1080
+
     def call_render(self, byrendermacro=False) -> None:
         self.byrendermacro = byrendermacro
         ioloop = IOLoop.current()
@@ -612,7 +640,6 @@ class Timelapse:
         elif not self.ffmpeg_installed:
             msg = f"{self.ffmpeg_binary_path} not found, please install ffmpeg"
             status = "error"
-            # cmd = outfile = None
             logging.info(f"timelapse: {msg}")
         else:
             self.renderisrunning = True
@@ -629,7 +656,7 @@ class Timelapse:
             inputfiles = self.temp_dir + "frame%6d.jpg"
             outfile = f"timelapse_{gcodefilename}_{date_time}"
 
-            # dublicate last frame
+            # duplicate last frame
             duplicates = []
             if self.config['duplicatelastframe'] > 0:
                 lastframe = filelist[-1:][0]
@@ -648,41 +675,97 @@ class Timelapse:
                 filelist = sorted(glob.glob(self.temp_dir + "frame*.jpg"))
                 self.framecount = len(filelist)
 
-            # variable framerate
+            cinematic_enabled = self.config.get('cinematic_enabled', False)
+
+            # Determine source timeline framerate and final output framerate
             if self.config['variable_fps']:
-                fps = int(self.framecount / self.config['targetlength'])
-                fps = max(min(fps,
+                source_fps = int(self.framecount / self.config['targetlength'])
+                source_fps = max(min(source_fps,
                               self.config['variable_fps_max']),
                           self.config['variable_fps_min'])
+            elif cinematic_enabled:
+                source_fps = int(self.config.get('source_timeline_fps', 10))
             else:
-                fps = self.config['output_framerate']
+                source_fps = int(self.config['output_framerate'])
 
-            # apply rotation
-            filterParam = ""
+            if cinematic_enabled:
+                output_fps = int(self.config.get('cinematic_output_fps', 30))
+            else:
+                output_fps = source_fps
+
+            # 1. Rotation and Flip filters (for video and preview image)
+            orientation_filters = []
             if self.config['rotation'] == 90 and self.config['flip_y']:
-                filterParam = " -vf 'transpose=3'"
+                orientation_filters.append("transpose=3")
             elif self.config['rotation'] == 90:
-                filterParam = " -vf 'transpose=1'"
+                orientation_filters.append("transpose=1")
             elif self.config['rotation'] == 180:
-                filterParam = " -vf 'hflip,vflip'"
+                orientation_filters.append("hflip,vflip")
             elif self.config['rotation'] == 270:
-                filterParam = " -vf 'transpose=2'"
+                orientation_filters.append("transpose=2")
             elif self.config['rotation'] == 270 and self.config['flip_y']:
-                filterParam = " -vf 'transpose=0'"
+                orientation_filters.append("transpose=0")
             elif self.config['rotation'] > 0:
                 pi = 3.141592653589793
                 rot = str(self.config['rotation']*(pi/180))
-                filterParam = " -vf 'rotate=" + rot + "'"
+                orientation_filters.append(f"rotate={rot}")
             elif self.config['flip_x'] and self.config['flip_y']:
-                filterParam = " -vf 'hflip,vflip'"
+                orientation_filters.append("hflip,vflip")
             elif self.config['flip_x']:
-                filterParam = " -vf 'hflip'"
+                orientation_filters.append("hflip")
             elif self.config['flip_y']:
-                filterParam = " -vf 'vflip'"
+                orientation_filters.append("vflip")
 
-            # build shell command
-            cmd = self.ffmpeg_binary_path \
-                + " -r " + str(fps) \
+            orientation_filterParam = ""
+            if orientation_filters:
+                orientation_filterParam = ' -vf "' + ",".join(orientation_filters) + '"'
+
+            filters = list(orientation_filters)
+
+            # 2. Cinematic enhancements
+            if cinematic_enabled:
+                # Exposure stabilization (deflicker)
+                if self.config.get('exposure_stabilization', False):
+                    filters.append("deflicker=size=10:mode=pm")
+
+                # Temporal frame interpolation
+                if self.config.get('temporal_interpolation', False) and output_fps != source_fps:
+                    filters.append(f"framerate=fps={output_fps}")
+
+                # Ken Burns Virtual Camera
+                if self.config.get('kenburns_enabled', False):
+                    width, height = self.get_frame_dimensions(filelist[0])
+                    tx = max(0.0, min(100.0, float(self.config.get('kenburns_target_x', 50.0)))) / 100.0
+                    ty = max(0.0, min(100.0, float(self.config.get('kenburns_target_y', 50.0)))) / 100.0
+                    z_target = max(1.0, float(self.config.get('kenburns_zoom', 1.06)))
+
+                    if self.config.get('temporal_interpolation', False):
+                        total_out = max(1, int(self.framecount * (output_fps / source_fps)))
+                    else:
+                        total_out = max(1, self.framecount)
+
+                    denom = max(1, total_out - 1)
+                    e_expr = f"(0.5-0.5*cos(3.14159265*(on-1)/{denom}))"
+                    z_expr = f"(1.0+({z_target - 1.0:.6f})*{e_expr})"
+
+                    cx_expr = f"(0.5+({tx - 0.5:.6f})*{e_expr})"
+                    cy_expr = f"(0.5+({ty - 0.5:.6f})*{e_expr})"
+
+                    x_expr = f"max(0,min(iw-iw/{z_expr},iw*{cx_expr}-iw/(2*{z_expr})))"
+                    y_expr = f"max(0,min(ih-ih/{z_expr},ih*{cy_expr}-ih/(2*{z_expr})))"
+
+                    zoompan = (
+                        f"zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':"
+                        f"d=1:s={width}x{height}:fps={output_fps}"
+                    )
+                    filters.append(zoompan)
+
+            filterParam = ""
+            if filters:
+                filterParam = ' -vf "' + ",".join(filters) + '"'
+
+            cmd = "nice -n 19 " + self.ffmpeg_binary_path \
+                + " -r " + str(source_fps) \
                 + " -i '" + inputfiles + "'" \
                 + filterParam \
                 + " -threads 2 -g 5" \
@@ -693,13 +776,20 @@ class Timelapse:
                 + " " + self.config['extraoutputparams'] \
                 + " '" + self.temp_dir + outfile + ".mp4' -y"
 
-            # log and notify ws
+            expected_duration = self.framecount / source_fps if source_fps > 0 else 0
+            logging.info("Timelapse: cinematic renderer starting FFMPEG")
+            logging.info(f"Timelapse: cinematic_enabled={cinematic_enabled}")
+            logging.info(f"Timelapse: source frames={self.framecount}, source_fps={source_fps}, output_fps={output_fps}")
+            logging.info(f"Timelapse: expected duration={expected_duration:.2f}s")
+            logging.info(f"Timelapse: Ken Burns enabled={self.config.get('kenburns_enabled', False)}, target_x={self.config.get('kenburns_target_x', 50)}%, target_y={self.config.get('kenburns_target_y', 50)}%, zoom={self.config.get('kenburns_zoom', 1.06)}")
+            logging.info(f"Timelapse: exposure stabilization={self.config.get('exposure_stabilization', False)}, temporal interpolation={self.config.get('temporal_interpolation', False)}")
             logging.info(f"start FFMPEG: {cmd}")
+
             result.update({
                 'status': 'started',
                 'framecount': str(self.framecount),
                 'settings': {
-                    'framerate': fps,
+                    'framerate': output_fps,
                     'crf': self.config['constant_rate_factor'],
                     'pixelformat': self.config['pixelformat']
                 }
@@ -709,6 +799,7 @@ class Timelapse:
             shell_cmd: SCMDComp = self.server.lookup_component('shell_command')
             self.notify_event(result)
             scmd = shell_cmd.build_shell_command(cmd, self.ffmpeg_cb)
+            cmdstatus = False
             try:
                 cmdstatus = await scmd.run(verbose=True,
                                            log_complete=False,
@@ -716,6 +807,30 @@ class Timelapse:
                                            )
             except Exception:
                 logging.exception(f"Error running cmd '{cmd}'")
+
+            # Fallback to standard render if cinematic filter fails
+            if not cmdstatus and cinematic_enabled:
+                logging.warning("Timelapse: Cinematic render failed. Attempting fallback standard render...")
+                fallback_fps = self.config['output_framerate']
+
+                cmd = "nice -n 19 " + self.ffmpeg_binary_path \
+                    + " -r " + str(fallback_fps) \
+                    + " -i '" + inputfiles + "'" \
+                    + orientation_filterParam \
+                    + " -threads 2 -g 5" \
+                    + " -crf " + str(self.config['constant_rate_factor']) \
+                    + " -vcodec libx264" \
+                    + " -pix_fmt " + self.config['pixelformat'] \
+                    + " -an" \
+                    + " " + self.config['extraoutputparams'] \
+                    + " '" + self.temp_dir + outfile + ".mp4' -y"
+
+                logging.info(f"Fallback FFMPEG command: {cmd}")
+                scmd = shell_cmd.build_shell_command(cmd, self.ffmpeg_cb)
+                try:
+                    cmdstatus = await scmd.run(verbose=True, log_complete=False, timeout=9999999999)
+                except Exception:
+                    logging.exception(f"Error running fallback cmd '{cmd}'")
 
             # check success
             if cmdstatus:
@@ -725,7 +840,6 @@ class Timelapse:
                     'filename': f"{outfile}.mp4",
                     'printfile': gcodefilename
                 })
-                # result.pop("framecount")
                 result.pop("settings")
 
                 # move finished output file to output directory
@@ -750,10 +864,10 @@ class Timelapse:
                         })
 
                     # apply rotation previewimage if needed
-                    if filterParam or self.config['extraoutputparams']:
+                    if orientation_filterParam or self.config['extraoutputparams']:
                         cmd = self.ffmpeg_binary_path \
                             + " -i '" + previewFilePath + "'" \
-                            + filterParam \
+                            + orientation_filterParam \
                             + " -an" \
                             + " " + self.config['extraoutputparams'] \
                             + " '" + previewFilePath + "' -y"
