@@ -8,11 +8,11 @@ A feature-rich extension for `moonraker-timelapse` that enhances 3D printer time
 
 1. **Duration-Preserving 30 FPS / 60 FPS Output**:
    - Separates the source frame timeline rate (e.g. 10 FPS) from the video output framerate (e.g. 30 FPS or 60 FPS).
-   - Generates smooth intermediate frames without shortening the final timelapse duration ($D = N / \text{source\_timeline\_fps}$).
+   - Generates smooth intermediate frames without shortening the final timelapse duration (`Duration = total_frames / source_timeline_fps`).
 
 2. **Ken Burns Virtual Camera Effect**:
    - Adds smooth, continuous virtual camera zoom and pan across the entire timelapse.
-   - Smooth Cosine Easing ($e = 0.5 - 0.5 \cos(\pi \cdot p)$) prevents sudden camera movements at the start or end.
+   - Smooth Cosine Easing prevents sudden camera movements at the start or end.
    - Dynamic boundary calculation ensures zero black borders or empty frame margins.
 
 3. **Configurable Target Zoom Focus Position**:
@@ -102,12 +102,12 @@ All cinematic enhancements are encapsulated inside [`component/timelapse.py`](co
 
 4. **`render(self, webrequest=None)`**:
    - **Timeline FPS & Duration Calculation**:
-     $D = \text{framecount} / \text{source\_timeline\_fps}$
+     `Duration = framecount / source_timeline_fps`
    - **FFmpeg Filtergraph Assembly**:
      - `orientation_filters`: Applies `transpose`, `hflip`, `vflip`, or `rotate`.
      - `deflicker=size=10:mode=pm`: Exposure stabilization.
      - `framerate=fps=30`: Temporal frame rate upsampling.
-     - `zoompan`: Eased zoom and dynamic center pan around $(\text{target\_x}, \text{target\_y})$.
+     - `zoompan`: Eased zoom and dynamic center pan around `(target_x, target_y)`.
    - **Process Isolation**: Executes FFmpeg via `nice -n 19` and `-threads 2`.
    - **Graceful Fallback**: If cinematic filtering fails, falls back automatically to standard renderer.
 
