@@ -722,29 +722,21 @@ class Timelapse:
 
             filters = list(orientation_filters)
 
-            # 2. Cinematic enhancements
+            # 2. Cinematic enhancements (Optimized pipeline)
             if cinematic_enabled:
-                # Exposure stabilization (deflicker)
+                # Exposure stabilization (deflicker) with size=5 buffer to prevent SWAP memory thrashing on 1GB RAM SBC
                 if self.config.get('exposure_stabilization', False):
-                    filters.append("deflicker=size=10:mode=pm")
+                    filters.append("deflicker=size=5:mode=pm")
 
-                # Temporal frame interpolation
-                if self.config.get('temporal_interpolation', False) and output_fps != source_fps:
-                    filters.append(f"framerate=fps={output_fps}")
-
-                # Ken Burns Virtual Camera
+                # Ken Burns Virtual Camera executed BEFORE framerate interpolation
+                # (Scales source frames at 10 FPS instead of 30 FPS, reducing CPU scaling work by 66%!)
                 if self.config.get('kenburns_enabled', False):
                     width, height = self.get_frame_dimensions(filelist[0])
                     tx = max(0.0, min(100.0, float(self.config.get('kenburns_target_x', 50.0)))) / 100.0
                     ty = max(0.0, min(100.0, float(self.config.get('kenburns_target_y', 50.0)))) / 100.0
                     z_target = max(1.0, float(self.config.get('kenburns_zoom', 1.06)))
 
-                    if self.config.get('temporal_interpolation', False):
-                        total_out = max(1, int(self.framecount * (output_fps / source_fps)))
-                    else:
-                        total_out = max(1, self.framecount)
-
-                    denom = max(1, total_out - 1)
+                    denom = max(1, self.framecount - 1)
                     e_expr = f"(0.5-0.5*cos(3.14159265*(on-1)/{denom}))"
                     z_expr = f"(1.0+({z_target - 1.0:.6f})*{e_expr})"
 
@@ -756,9 +748,13 @@ class Timelapse:
 
                     zoompan = (
                         f"zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':"
-                        f"d=1:s={width}x{height}:fps={output_fps}"
+                        f"d=1:s={width}x{height}:fps={source_fps}"
                     )
                     filters.append(zoompan)
+
+                # Temporal frame interpolation executed AFTER zoompan
+                if self.config.get('temporal_interpolation', False) and output_fps != source_fps:
+                    filters.append(f"framerate=fps={output_fps}")
 
             filterParam = ""
             if filters:
@@ -770,14 +766,14 @@ class Timelapse:
                 + filterParam \
                 + " -threads 2 -g 5" \
                 + " -crf " + str(self.config['constant_rate_factor']) \
-                + " -vcodec libx264" \
+                + " -vcodec libx264 -preset superfast" \
                 + " -pix_fmt " + self.config['pixelformat'] \
                 + " -an" \
                 + " " + self.config['extraoutputparams'] \
                 + " '" + self.temp_dir + outfile + ".mp4' -y"
 
             expected_duration = self.framecount / source_fps if source_fps > 0 else 0
-            logging.info("Timelapse: cinematic renderer starting FFMPEG")
+            logging.info("Timelapse: cinematic renderer starting FFMPEG (optimized)")
             logging.info(f"Timelapse: cinematic_enabled={cinematic_enabled}")
             logging.info(f"Timelapse: source frames={self.framecount}, source_fps={source_fps}, output_fps={output_fps}")
             logging.info(f"Timelapse: expected duration={expected_duration:.2f}s")
@@ -819,7 +815,7 @@ class Timelapse:
                     + orientation_filterParam \
                     + " -threads 2 -g 5" \
                     + " -crf " + str(self.config['constant_rate_factor']) \
-                    + " -vcodec libx264" \
+                    + " -vcodec libx264 -preset superfast" \
                     + " -pix_fmt " + self.config['pixelformat'] \
                     + " -an" \
                     + " " + self.config['extraoutputparams'] \
