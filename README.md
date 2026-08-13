@@ -1,31 +1,39 @@
-# Moonraker Timelapse — Cinematic Render Enhancement
+# Moonraker Timelapse — Cinematic & Dynamic Bed Parking Enhancement
 
-A feature-rich extension for `moonraker-timelapse` that enhances 3D printer timelapses with virtual camera movement (Ken Burns effect), frame rate interpolation, and exposure stabilization without changing frame capture workflows or compromising printer performance.
+A feature-rich extension for `moonraker-timelapse` that enhances 3D printer timelapses with **Dynamic Toolhead Bed Parking** (physical camera dolly slide) and **Cinematic Virtual Camera Motion** (Ken Burns effect, temporal frame rate interpolation, and exposure stabilization) without changing frame capture workflows or compromising printer performance.
 
 ---
 
 ## Key Features
 
-1. **Duration-Preserving 30 FPS / 60 FPS Output**:
+1. **Dynamic Toolhead Bed Parking (Physical Camera Dolly Slide)**:
+   - Moves the print bed progressively along the Y-axis across layers from `park_dynamic_y_min` to `park_dynamic_y_max`.
+   - Creates a physical camera dolly slide illusion in the timelapse video without adding print time.
+   - Clamped within safe physical boundaries (`y_min` to `y_max`) to protect bed cables and endstops.
+   - Automatically falls back to static parking if layer count is unknown.
+
+2. **Duration-Preserving 30 FPS / 60 FPS Output**:
    - Separates the source frame timeline rate (e.g. 10 FPS) from the video output framerate (e.g. 30 FPS or 60 FPS).
    - Generates smooth intermediate frames without shortening the final timelapse duration (`Duration = total_frames / source_timeline_fps`).
 
-2. **Ken Burns Virtual Camera Effect**:
+3. **Ken Burns Virtual Camera Effect**:
    - Adds smooth, continuous virtual camera zoom and pan across the entire timelapse.
    - Smooth Cosine Easing prevents sudden camera movements at the start or end.
    - Dynamic boundary calculation ensures zero black borders or empty frame margins.
 
-3. **Configurable Target Zoom Focus Position**:
+4. **Configurable Target Zoom Focus Position**:
    - `kenburns_target_x` (0% to 100%, default 50%): Horizontal zoom focus point.
    - `kenburns_target_y` (0% to 100%, default 50%): Vertical zoom focus point.
    - Allows zooming directly into off-center 3D prints on the print bed.
 
-4. **Exposure Deflickering**:
+5. **Exposure Deflickering**:
    - Uses FFmpeg `deflicker` to remove frame-to-frame webcam brightness variations.
 
-5. **Resource-Isolated Streaming Pipeline**:
-   - Single FFmpeg streaming filtergraph: zero intermediate JPEGs saved to disk.
-   - Runs under `nice -n 19` with CPU thread limits to prevent interference with Klipper print execution or go2rtc webcam streaming.
+6. **Resource-Isolated High-Performance Pipeline**:
+   - Single FFmpeg filtergraph: zero intermediate JPEGs saved to disk.
+   - Optimized filter order (`zoompan` at 10 FPS source before upsampling) reduces CPU scaling workload by 66%.
+   - Uses H.264 `superfast` encoder preset and bounded memory buffers (`size=5`) to prevent SWAP memory thrashing.
+   - Runs under `nice -n 19` with CPU thread limits to protect Klipper print execution priority.
    - Automatic fallback to standard rendering if any filter fails.
 
 ---
@@ -38,9 +46,26 @@ Add or modify the following options in your `moonraker.conf` file under the `[ti
 [timelapse]
 output_path: ~/printer_data/timelapse/
 frame_path: ~/printer_data/timelapse/frame
+snapshoturl: http://localhost:1984/api/frame.jpeg?src=printer
 
 # ----------------------------------------------------------------------
-# Cinematic Render Enhancement Configuration
+# Dynamic Toolhead Bed Parking Options (Linear Progressive Slide)
+# ----------------------------------------------------------------------
+
+# Enable/disable progressive Y-axis bed parking move across layers (True / False)
+# Range: True, False | Default: False
+park_dynamic_enabled: False
+
+# Minimum Y-axis bed parking position in mm (start of print)
+# Range: 0.0 to 220.0 mm | Default: 30.0
+park_dynamic_y_min: 30.0
+
+# Maximum Y-axis bed parking position in mm (end of print)
+# Range: 0.0 to 220.0 mm | Default: 180.0
+park_dynamic_y_max: 180.0
+
+# ----------------------------------------------------------------------
+# Cinematic Render Enhancement Options
 # ----------------------------------------------------------------------
 
 # Master switch for cinematic rendering pipeline (True / False)
@@ -82,34 +107,24 @@ cinematic_output_fps: 30
 
 ---
 
-## Implementation & Code Architecture
+## Implementation & Architecture
 
-All cinematic enhancements are encapsulated inside [`component/timelapse.py`](component/timelapse.py):
+### 1. Klipper Macro (`klipper_macro/timelapse.cfg`)
+- **`TIMELAPSE_TAKE_FRAME`**: When `park_dynamic_enabled` is active, queries `current_layer` and `total_layer` from Klipper `print_stats`.
+- Calculates progressive target Y position:
+  `target_y = y_min + (current_layer - 1) / (total_layers - 1) * (y_max - y_min)`
+- Clamps `target_y` safely within `[y_min, y_max]`.
+- Moves the toolhead/bed to the calculated position before taking the snapshot.
 
-### Core Functions & Methods
-
-1. **`__init__(self, confighelper)`**:
-   - Registers configuration defaults (`cinematic_enabled`, `kenburns_enabled`, `kenburns_zoom`, `kenburns_target_x`, `kenburns_target_y`, `exposure_stabilization`, `temporal_interpolation`, `source_timeline_fps`, `cinematic_output_fps`).
-   - Merges database overrides and `moonraker.conf` settings.
-
-2. **`webrequest_settings(self, webrequest)`**:
-   - Handles `GET` and `POST` HTTP requests to `/machine/timelapse/settings`.
-   - Validates parameter ranges (e.g. clamping target X/Y coordinates between 0% and 100%).
-   - Persists updated settings into Moonraker DB (`self.database.insert_item`).
-
-3. **`get_frame_dimensions(self, filepath)`**:
-   - Reads the JPEG file header to extract original frame width and height (`width, height`) for `zoompan` scale calculation.
-
-4. **`render(self, webrequest=None)`**:
-   - **Timeline FPS & Duration Calculation**:
-     `Duration = framecount / source_timeline_fps`
-   - **FFmpeg Filtergraph Assembly**:
-     - `orientation_filters`: Applies `transpose`, `hflip`, `vflip`, or `rotate`.
-     - `deflicker=size=10:mode=pm`: Exposure stabilization.
-     - `framerate=fps=30`: Temporal frame rate upsampling.
-     - `zoompan`: Eased zoom and dynamic center pan around `(target_x, target_y)`.
-   - **Process Isolation**: Executes FFmpeg via `nice -n 19` and `-threads 2`.
-   - **Graceful Fallback**: If cinematic filtering fails, falls back automatically to standard renderer.
+### 2. Moonraker Component (`component/timelapse.py`)
+- **`__init__(self, confighelper)`**:
+  Registers configuration defaults for cinematic rendering and dynamic bed parking.
+- **`webrequest_settings(self, webrequest)`**:
+  Handles API requests at `/machine/timelapse/settings` and persists settings to Moonraker DB.
+- **`setgcodevariables(self)`**:
+  Transmits dynamic parking parameters (`PARK_DYNAMIC_ENABLE`, `PARK_DYNAMIC_Y_MIN`, `PARK_DYNAMIC_Y_MAX`) to Klipper via `_SET_TIMELAPSE_SETUP`.
+- **`render(self, webrequest=None)`**:
+  Executes high-performance FFmpeg rendering pipeline with `nice -n 19`, `-threads 2`, `-preset superfast`, and fallback error handling.
 
 ---
 
