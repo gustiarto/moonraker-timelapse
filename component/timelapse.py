@@ -86,6 +86,10 @@ class Timelapse:
             'duplicatelastframe': 5,
             'previewimage': True,
             'saveframes': False,
+            # Dynamic Bed Parking options
+            'park_dynamic_enabled': False,
+            'park_dynamic_y_min': 30.0,
+            'park_dynamic_y_max': 180.0,
             # Cinematic render enhancement options
             'cinematic_enabled': True,
             'kenburns_enabled': True,
