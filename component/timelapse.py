@@ -398,6 +398,9 @@ class Timelapse:
             + f" EXTRUDE_DISTANCE={self.config['park_extrude_distance']}" \
             + f" PARK_TIME={self.config['park_time']}" \
             + f" FW_RETRACT={self.config['fw_retract']}" \
+            + f" PARK_DYNAMIC_ENABLE={self.config['park_dynamic_enabled']}" \
+            + f" PARK_DYNAMIC_Y_MIN={self.config['park_dynamic_y_min']}" \
+            + f" PARK_DYNAMIC_Y_MAX={self.config['park_dynamic_y_max']}"
 
         logging.debug(f"run gcommand: {gcommand}")
         try:
