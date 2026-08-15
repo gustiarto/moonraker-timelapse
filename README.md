@@ -6,7 +6,12 @@ A feature-rich extension for `moonraker-timelapse` that enhances 3D printer time
 
 ## Key Features
 
-1. **Dynamic Toolhead Bed Parking (Physical Camera Dolly Slide)**:
+1. **Automatic Layer Change Detection (`auto_layer` Mode)**:
+   - Automatically tracks physical Z-height layer increases in real time via Klipper status updates (`gcode_move`).
+   - Requires **ZERO Slicer setup** — no need to insert `TIMELAPSE_TAKE_FRAME` into layer change G-Code!
+   - Triggers clean toolhead parking (static or dynamic dolly slide) automatically at every physical layer.
+
+2. **Dynamic Toolhead Bed Parking (Physical Camera Dolly Slide)**:
    - Moves the print bed progressively along the Y-axis across layers from `park_dynamic_y_min` to `park_dynamic_y_max`.
    - Creates a physical camera dolly slide illusion in the timelapse video without adding print time.
    - Clamped within safe physical boundaries (`y_min` to `y_max`) to protect bed cables and endstops.

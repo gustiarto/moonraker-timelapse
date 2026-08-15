@@ -145,6 +145,7 @@ class Timelapse:
         self.takingframe = False
         self.byrendermacro = False
         self.noWebcamDb = False
+        self.last_z = 0.0
 
         # setup eventhandlers and endpoints
         file_manager = self.server.lookup_component("file_manager")
@@ -382,6 +383,11 @@ class Timelapse:
         ioloop = IOLoop.current()
         ioloop.spawn_callback(self.stop_hyperlapse)
 
+        try:
+            await self.klippy_apis.subscribe_objects({'gcode_move': None, 'print_stats': None})
+        except Exception:
+            logging.exception("auto_layer: failed to subscribe gcode_move/print_stats objects")
+
     async def setgcodevariables(self) -> None:
         gcommand = "_SET_TIMELAPSE_SETUP " \
             + f" ENABLE={self.config['enabled']}" \
@@ -526,8 +532,29 @@ class Timelapse:
                 state = printstats['state']
                 if state == 'cancelled':
                     self.printing = False
+                    self.last_z = 0.0
                     ioloop = IOLoop.current()
                     ioloop.spawn_callback(self.stop_hyperlapse)
+                elif state == 'printing':
+                    self.printing = True
+
+        if self.config['enabled'] and self.config['mode'] == 'auto_layer' and self.printing:
+            if 'gcode_move' in status:
+                gcode_move = status['gcode_move']
+                if 'gcode_position' in gcode_move and isinstance(gcode_move['gcode_position'], list):
+                    current_z = round(float(gcode_move['gcode_position'][2]), 3)
+                    if current_z > self.last_z + 0.05 and current_z > 0.0:
+                        self.last_z = current_z
+                        if not self.takingframe:
+                            logging.info(f"auto_layer: Z height changed to {current_z}mm, triggering TIMELAPSE_TAKE_FRAME")
+                            ioloop = IOLoop.current()
+                            ioloop.spawn_callback(self.call_auto_layer_frame)
+
+    async def call_auto_layer_frame(self) -> None:
+        try:
+            await self.klippy_apis.run_gcode("TIMELAPSE_TAKE_FRAME")
+        except Exception:
+            logging.exception("Failed to execute TIMELAPSE_TAKE_FRAME for auto_layer mode")
 
     async def handle_gcode_response(self, gresponse: str) -> None:
         if gresponse == "File selected":
@@ -565,6 +592,7 @@ class Timelapse:
                 os.remove(filepath)
         self.framecount = 0
         self.lastframefile = ""
+        self.last_z = 0.0
 
     def call_saveFramesZip(self) -> None:
         ioloop = IOLoop.current()
