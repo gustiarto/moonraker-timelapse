@@ -836,19 +836,17 @@ class Timelapse:
                     else:
                         start_ts = float(start_ts)
 
-                    layer_str = f"LAYER %{{n}} / {total_layers}"
-                    time_str = f"DATE %{{pts\\:localtime\\:{int(start_ts)}}}"
-
+                    date_str = f"%{{pts\\:localtime\\:{int(start_ts)}}}"
                     if filament_name:
                         clean_fil = filament_name.replace("'", "").replace(":", "-")
-                        text_content = f"{layer_str}\n{time_str}\nFILAMENT {clean_fil}"
+                        text_content = f"{date_str}\n%{{n}} / {total_layers} | {clean_fil}"
                     else:
-                        text_content = f"{layer_str}\n{time_str}"
+                        text_content = f"{date_str}\n%{{n}} / {total_layers}"
 
                     drawtext = (
                         f"drawtext=fontfile='{font_path}':text='{text_content}':"
-                        f"fontcolor=white:fontsize=24:x={pos_x}:y={pos_y}:"
-                        f"box=1:boxcolor=black@0.65:boxborderw=10"
+                        f"fontcolor=white:fontsize=12:x={pos_x}:y={pos_y}:"
+                        f"box=1:boxcolor=black@0.65:boxborderw=8"
                     )
                     filters.append(drawtext)
                 except Exception as ex:
