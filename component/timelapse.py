@@ -828,8 +828,16 @@ class Timelapse:
                     pos_x = "w-tw-30" if "right" in overlay_pos else "30"
                     pos_y = "h-th-30" if "bottom" in overlay_pos else "30"
 
+                    start_ts = file_meta.get("print_start_time")
+                    if not start_ts:
+                        start_ts = pstats.get("print_start_time")
+                    if not start_ts or float(start_ts) <= 0:
+                        start_ts = time.time() - float(est_time)
+                    else:
+                        start_ts = float(start_ts)
+
                     layer_str = f"LAYER %{{n}} / {total_layers}"
-                    time_str = f"TIME %{{eif\\:(n-1)*{time_step:.2f}/3600\\:d\\:2}}\\:%{{eif\\:mod((n-1)*{time_step:.2f},3600)/60\\:d\\:2}}\\:%{{eif\\:mod((n-1)*{time_step:.2f},60)\\:d\\:2}}"
+                    time_str = f"DATE %{{pts\\:localtime\\:{int(start_ts)}}}"
 
                     if filament_name:
                         clean_fil = filament_name.replace("'", "").replace(":", "-")
