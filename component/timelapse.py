@@ -99,7 +99,11 @@ class Timelapse:
             'exposure_stabilization': True,
             'temporal_interpolation': True,
             'source_timeline_fps': 10,
-            'cinematic_output_fps': 30
+            'cinematic_output_fps': 30,
+            # Text overlay options
+            'text_overlay_enabled': True,
+            'text_overlay_style': "minimalist",
+            'text_overlay_pos': "bottom_right"
         }
 
         # Get Config from Database and overwrite defaults
@@ -790,6 +794,57 @@ class Timelapse:
                 # Temporal frame interpolation executed AFTER zoompan
                 if self.config.get('temporal_interpolation', False) and output_fps != source_fps:
                     filters.append(f"framerate=fps={output_fps}")
+
+            # 3. Text Overlay (Layer, Time, Filament)
+            if self.config.get('text_overlay_enabled', True):
+                try:
+                    file_meta = {}
+                    if gcodefilename:
+                        file_mgr = self.server.lookup_component("file_manager")
+                        file_meta = await file_mgr.get_file_metadata(gcodefilename)
+
+                    total_layers = file_meta.get("layer_count")
+                    if not total_layers or int(total_layers) <= 1:
+                        total_layers = self.framecount
+                    else:
+                        total_layers = int(total_layers)
+
+                    filament_raw = file_meta.get("filament_name", "")
+                    if filament_raw:
+                        filament_name = filament_raw.split("/")[-1].strip()
+                    else:
+                        filament_name = file_meta.get("filament_type", "").strip()
+
+                    est_time = file_meta.get("estimated_time", 0)
+                    if not est_time or float(est_time) <= 0:
+                        est_time = pstats.get("total_duration", 0)
+                    time_step = float(est_time) / max(1, self.framecount)
+
+                    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+                    if not os.path.isfile(font_path):
+                        font_path = "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf"
+
+                    overlay_pos = self.config.get('text_overlay_pos', 'bottom_right')
+                    pos_x = "w-tw-30" if "right" in overlay_pos else "30"
+                    pos_y = "h-th-30" if "bottom" in overlay_pos else "30"
+
+                    layer_str = f"LAYER %{{n}} / {total_layers}"
+                    time_str = f"TIME %{{eif\\:(n-1)*{time_step:.2f}/3600\\:d\\:2}}\\:%{{eif\\:mod((n-1)*{time_step:.2f},3600)/60\\:d\\:2}}\\:%{{eif\\:mod((n-1)*{time_step:.2f},60)\\:d\\:2}}"
+
+                    if filament_name:
+                        clean_fil = filament_name.replace("'", "").replace(":", "-")
+                        text_content = f"{layer_str}\n{time_str}\nFILAMENT {clean_fil}"
+                    else:
+                        text_content = f"{layer_str}\n{time_str}"
+
+                    drawtext = (
+                        f"drawtext=fontfile='{font_path}':text='{text_content}':"
+                        f"fontcolor=white:fontsize=24:x={pos_x}:y={pos_y}:"
+                        f"box=1:boxcolor=black@0.65:boxborderw=10"
+                    )
+                    filters.append(drawtext)
+                except Exception as ex:
+                    logging.exception(f"Timelapse: text overlay assembly error: {ex}")
 
             filterParam = ""
             if filters:

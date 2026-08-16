@@ -31,7 +31,12 @@ A feature-rich extension for `moonraker-timelapse` that enhances 3D printer time
    - `kenburns_target_y` (0% to 100%, default 50%): Vertical zoom focus point.
    - Allows zooming directly into off-center 3D prints on the print bed.
 
-5. **Exposure Deflickering**:
+5. **Cinematic Text Overlay (Layer, Elapsed Time & Filament Name)**:
+   - Overlays real-time frame layer number (`LAYER 45 / 200`), elapsed print time (`TIME 01:45:20`), and filament brand/name (`FILAMENT SUNLU PETG Black`) onto the video.
+   - Rendered in C inside RAM during the FFmpeg filtergraph pass — **0ms impact on toolhead pause duration & 0 MB extra RAM**.
+   - Fully customizable overlay position (`bottom_right`, `bottom_left`, `top_right`, `top_left`) with semi-transparent dark translucent pill box.
+
+6. **Exposure Deflickering**:
    - Uses FFmpeg `deflicker` to remove frame-to-frame webcam brightness variations.
 
 6. **Resource-Isolated High-Performance Pipeline**:
