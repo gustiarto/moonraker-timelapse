@@ -801,7 +801,7 @@ class Timelapse:
                     file_meta = {}
                     if gcodefilename:
                         file_mgr = self.server.lookup_component("file_manager")
-                        file_meta = await file_mgr.get_file_metadata(gcodefilename)
+                        file_meta = file_mgr.get_file_metadata(gcodefilename)
 
                     total_layers = file_meta.get("layer_count")
                     if not total_layers or int(total_layers) <= 1:
