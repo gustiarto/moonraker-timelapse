@@ -389,6 +389,11 @@ class Timelapse:
 
         try:
             await self.klippy_apis.subscribe_objects({'gcode_move': None, 'print_stats': None})
+            kresult = await self.klippy_apis.query_objects({'print_stats': None})
+            pstats = kresult.get("print_stats", {})
+            if pstats.get("state") == "printing":
+                self.printing = True
+                logging.info("auto_layer: active printing state detected on klippy_ready")
         except Exception:
             logging.exception("auto_layer: failed to subscribe gcode_move/print_stats objects")
 
