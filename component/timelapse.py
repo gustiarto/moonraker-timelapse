@@ -547,7 +547,10 @@ class Timelapse:
                 gcode_move = status['gcode_move']
                 if 'gcode_position' in gcode_move and isinstance(gcode_move['gcode_position'], list):
                     current_z = round(float(gcode_move['gcode_position'][2]), 3)
-                    if current_z > self.last_z + 0.05 and current_z > 0.0:
+                    if current_z < self.last_z - 2.0 or self.last_z > 300.0:
+                        logging.info(f"auto_layer: Z height reset from {self.last_z}mm to {current_z}mm")
+                        self.last_z = current_z
+                    elif current_z > self.last_z + 0.05 and current_z > 0.0:
                         self.last_z = current_z
                         if not self.takingframe:
                             logging.info(f"auto_layer: Z height changed to {current_z}mm, triggering TIMELAPSE_TAKE_FRAME")
