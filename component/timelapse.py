@@ -775,10 +775,19 @@ class Timelapse:
                         total_layers = int(total_layers)
 
                     filament_raw = file_meta.get("filament_name", "")
-                    if filament_raw:
-                        filament_name = filament_raw.split("/")[-1].strip()
-                    else:
-                        filament_name = file_meta.get("filament_type", "").strip()
+                    if not filament_raw:
+                        filament_raw = file_meta.get("filament_type", "")
+
+                    filament_name = ""
+                    if isinstance(filament_raw, list) and filament_raw:
+                        filament_name = str(filament_raw[0]).strip()
+                    elif isinstance(filament_raw, str) and filament_raw:
+                        clean_str = filament_raw.strip().lstrip("[").rstrip("]").strip()
+                        if "," in clean_str:
+                            first_item = clean_str.split(",")[0].strip()
+                        else:
+                            first_item = clean_str.split("/")[-1].strip()
+                        filament_name = first_item.replace('"', '').replace("'", "").strip()
 
                     est_time = file_meta.get("estimated_time", 0)
                     if not est_time or float(est_time) <= 0:
@@ -802,8 +811,8 @@ class Timelapse:
                         start_ts = float(start_ts)
 
                     date_str = f"%{{pts\\:localtime\\:{int(start_ts)}}}"
-                    if filament_name:
-                        clean_fil = filament_name.replace("'", "").replace(":", "-")
+                    clean_fil = filament_name.replace("'", "").replace('"', '').replace("[", "").replace("]", "").replace(":", "-").replace("%", "").strip()
+                    if clean_fil:
                         text_content = f"{date_str}\n%{{n}} / {total_layers} | {clean_fil}"
                     else:
                         text_content = f"{date_str}\n%{{n}} / {total_layers}"
