@@ -1,42 +1,31 @@
-# Moonraker Timelapse — Cinematic & Dynamic Bed Parking Enhancement
+# Moonraker Timelapse — Cinematic Enhancement
 
-A feature-rich extension for `moonraker-timelapse` that enhances 3D printer timelapses with **Dynamic Toolhead Bed Parking** (physical camera dolly slide) and **Cinematic Virtual Camera Motion** (Ken Burns effect, temporal frame rate interpolation, and exposure stabilization) without changing frame capture workflows or compromising printer performance.
+A high-performance cinematic rendering extension for `moonraker-timelapse` that enhances 3D printer timelapses with **Virtual Camera Motion** (Ken Burns zoom and pan), **Temporal Frame Interpolation** (smooth 30 FPS / 60 FPS output), **Exposure Deflickering**, and **Real-Time Cinematic Text Overlays** without adding extra print time or CPU load during printing.
 
 ---
 
 ## Key Features
 
-1. **Automatic Layer Change Detection (`auto_layer` Mode)**:
-   - Automatically tracks physical Z-height layer increases in real time via Klipper status updates (`gcode_move`).
-   - Requires **ZERO Slicer setup** — no need to insert `TIMELAPSE_TAKE_FRAME` into layer change G-Code!
-   - Triggers clean toolhead parking (static or dynamic dolly slide) automatically at every physical layer.
-
-2. **Dynamic Toolhead Bed Parking (Physical Camera Dolly Slide)**:
-   - Moves the print bed progressively along the Y-axis across layers from `park_dynamic_y_min` to `park_dynamic_y_max`.
-   - Creates a physical camera dolly slide illusion in the timelapse video without adding print time.
-   - Clamped within safe physical boundaries (`y_min` to `y_max`) to protect bed cables and endstops.
-   - Automatically falls back to static parking if layer count is unknown.
-
-2. **Duration-Preserving 30 FPS / 60 FPS Output**:
+1. **Duration-Preserving 30 FPS / 60 FPS Output**:
    - Separates the source frame timeline rate (e.g. 10 FPS) from the video output framerate (e.g. 30 FPS or 60 FPS).
    - Generates smooth intermediate frames without shortening the final timelapse duration (`Duration = total_frames / source_timeline_fps`).
 
-3. **Ken Burns Virtual Camera Effect**:
+2. **Ken Burns Virtual Camera Effect**:
    - Adds smooth, continuous virtual camera zoom and pan across the entire timelapse.
    - Smooth Cosine Easing prevents sudden camera movements at the start or end.
    - Dynamic boundary calculation ensures zero black borders or empty frame margins.
 
-4. **Configurable Target Zoom Focus Position**:
+3. **Configurable Target Zoom Focus Position**:
    - `kenburns_target_x` (0% to 100%, default 50%): Horizontal zoom focus point.
    - `kenburns_target_y` (0% to 100%, default 50%): Vertical zoom focus point.
    - Allows zooming directly into off-center 3D prints on the print bed.
 
-5. **Cinematic Text Overlay (Layer, Elapsed Time & Filament Name)**:
-   - Overlays real-time frame layer number (`LAYER 45 / 200`), elapsed print time (`TIME 01:45:20`), and filament brand/name (`FILAMENT SUNLU PETG Black`) onto the video.
+4. **Cinematic Text Overlay (Layer, Real-Time Datetime & Filament Name)**:
+   - Overlays real-time frame layer number (`1 / 342`), local datetime (`YYYY-MM-DD HH:MM:SS`), and filament name (`SUNLU PETG`) onto the video.
    - Rendered in C inside RAM during the FFmpeg filtergraph pass — **0ms impact on toolhead pause duration & 0 MB extra RAM**.
    - Fully customizable overlay position (`bottom_right`, `bottom_left`, `top_right`, `top_left`) with semi-transparent dark translucent pill box.
 
-6. **Exposure Deflickering**:
+5. **Exposure Deflickering**:
    - Uses FFmpeg `deflicker` to remove frame-to-frame webcam brightness variations.
 
 6. **Resource-Isolated High-Performance Pipeline**:
@@ -58,21 +47,10 @@ output_path: ~/printer_data/timelapse/
 frame_path: ~/printer_data/timelapse/frame
 snapshoturl: http://localhost:1984/api/frame.jpeg?src=printer
 
-# ----------------------------------------------------------------------
-# Dynamic Toolhead Bed Parking Options (Linear Progressive Slide)
-# ----------------------------------------------------------------------
-
-# Enable/disable progressive Y-axis bed parking move across layers (True / False)
-# Range: True, False | Default: False
-park_dynamic_enabled: False
-
-# Minimum Y-axis bed parking position in mm (start of print)
-# Range: 0.0 to 220.0 mm | Default: 30.0
-park_dynamic_y_min: 30.0
-
-# Maximum Y-axis bed parking position in mm (end of print)
-# Range: 0.0 to 220.0 mm | Default: 180.0
-park_dynamic_y_max: 180.0
+# Timelapse trigger mode (layermacro / hyperlapse)
+# - layermacro: Triggers snapshot via TIMELAPSE_TAKE_FRAME G-Code in Slicer
+# - hyperlapse: Triggers snapshot automatically at fixed time intervals (e.g. every 30s)
+mode: layermacro
 
 # ----------------------------------------------------------------------
 # Cinematic Render Enhancement Options

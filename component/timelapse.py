@@ -86,10 +86,6 @@ class Timelapse:
             'duplicatelastframe': 5,
             'previewimage': True,
             'saveframes': False,
-            # Dynamic Bed Parking options
-            'park_dynamic_enabled': False,
-            'park_dynamic_y_min': 30.0,
-            'park_dynamic_y_max': 180.0,
             # Cinematic render enhancement options
             'cinematic_enabled': True,
             'kenburns_enabled': True,
@@ -149,7 +145,6 @@ class Timelapse:
         self.takingframe = False
         self.byrendermacro = False
         self.noWebcamDb = False
-        self.last_z = 0.0
 
         # setup eventhandlers and endpoints
         file_manager = self.server.lookup_component("file_manager")
@@ -387,16 +382,6 @@ class Timelapse:
         ioloop = IOLoop.current()
         ioloop.spawn_callback(self.stop_hyperlapse)
 
-        try:
-            await self.klippy_apis.subscribe_objects({'gcode_move': None, 'print_stats': None})
-            kresult = await self.klippy_apis.query_objects({'print_stats': None})
-            pstats = kresult.get("print_stats", {})
-            if pstats.get("state") == "printing":
-                self.printing = True
-                logging.info("auto_layer: active printing state detected on klippy_ready")
-        except Exception:
-            logging.exception("auto_layer: failed to subscribe gcode_move/print_stats objects")
-
     async def setgcodevariables(self) -> None:
         gcommand = "_SET_TIMELAPSE_SETUP " \
             + f" ENABLE={self.config['enabled']}" \
@@ -412,10 +397,7 @@ class Timelapse:
             + f" RETRACT_DISTANCE={self.config['park_retract_distance']}" \
             + f" EXTRUDE_DISTANCE={self.config['park_extrude_distance']}" \
             + f" PARK_TIME={self.config['park_time']}" \
-            + f" FW_RETRACT={self.config['fw_retract']}" \
-            + f" PARK_DYNAMIC_ENABLE={self.config['park_dynamic_enabled']}" \
-            + f" PARK_DYNAMIC_Y_MIN={self.config['park_dynamic_y_min']}" \
-            + f" PARK_DYNAMIC_Y_MAX={self.config['park_dynamic_y_max']}"
+            + f" FW_RETRACT={self.config['fw_retract']}"
 
         logging.debug(f"run gcommand: {gcommand}")
         try:
@@ -541,32 +523,8 @@ class Timelapse:
                 state = printstats['state']
                 if state == 'cancelled':
                     self.printing = False
-                    self.last_z = 0.0
                     ioloop = IOLoop.current()
                     ioloop.spawn_callback(self.stop_hyperlapse)
-                elif state == 'printing':
-                    self.printing = True
-
-        if self.config['enabled'] and self.config['mode'] == 'auto_layer' and self.printing:
-            if 'gcode_move' in status:
-                gcode_move = status['gcode_move']
-                if 'gcode_position' in gcode_move and isinstance(gcode_move['gcode_position'], list):
-                    current_z = round(float(gcode_move['gcode_position'][2]), 3)
-                    if current_z < self.last_z - 2.0 or self.last_z > 300.0:
-                        logging.info(f"auto_layer: Z height reset from {self.last_z}mm to {current_z}mm")
-                        self.last_z = current_z
-                    elif current_z > self.last_z + 0.05 and current_z > 0.0:
-                        self.last_z = current_z
-                        if not self.takingframe:
-                            logging.info(f"auto_layer: Z height changed to {current_z}mm, triggering TIMELAPSE_TAKE_FRAME")
-                            ioloop = IOLoop.current()
-                            ioloop.spawn_callback(self.call_auto_layer_frame)
-
-    async def call_auto_layer_frame(self) -> None:
-        try:
-            await self.klippy_apis.run_gcode("TIMELAPSE_TAKE_FRAME")
-        except Exception:
-            logging.exception("Failed to execute TIMELAPSE_TAKE_FRAME for auto_layer mode")
 
     async def handle_gcode_response(self, gresponse: str) -> None:
         if gresponse == "File selected":
@@ -604,7 +562,6 @@ class Timelapse:
                 os.remove(filepath)
         self.framecount = 0
         self.lastframefile = ""
-        self.last_z = 0.0
 
     def call_saveFramesZip(self) -> None:
         ioloop = IOLoop.current()
