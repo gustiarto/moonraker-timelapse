@@ -483,6 +483,8 @@ class Timelapse:
         # make sure webcamconfig is uptodate before grabbing a new frame
         await self.getWebcamConfig()
 
+        os.makedirs(self.temp_dir, exist_ok=True)
+
         options = ""
         if self.wget_skip_cert:
             options += "--no-check-certificate "
@@ -556,6 +558,7 @@ class Timelapse:
 
     def cleanup(self) -> None:
         logging.debug("cleanup frame directory")
+        os.makedirs(self.temp_dir, exist_ok=True)
         filelist = glob.glob(self.temp_dir + "frame*.jpg")
         if filelist:
             for filepath in filelist:
