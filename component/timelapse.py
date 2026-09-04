@@ -86,6 +86,8 @@ class Timelapse:
             'duplicatelastframe': 5,
             'previewimage': True,
             'saveframes': False,
+            # Portrait 9:16 rendering option
+            'portrait_mode': False,
             # Cinematic render enhancement options
             'cinematic_enabled': True,
             'kenburns_enabled': True,
@@ -701,6 +703,10 @@ class Timelapse:
                 output_fps = source_fps
 
             # 1. Rotation and Flip filters (for video and preview image)
+            raw_width, raw_height = self.get_frame_dimensions(filelist[0])
+            portrait_mode = self.config.get('portrait_mode', False)
+            is_portrait = portrait_mode or (self.config.get('rotation') in [90, 270])
+
             orientation_filters = []
             if self.config['rotation'] == 90 and self.config['flip_y']:
                 orientation_filters.append("transpose=3")
@@ -712,6 +718,8 @@ class Timelapse:
                 orientation_filters.append("transpose=2")
             elif self.config['rotation'] == 270 and self.config['flip_y']:
                 orientation_filters.append("transpose=0")
+            elif portrait_mode and self.config.get('rotation', 0) == 0:
+                orientation_filters.append("transpose=1")
             elif self.config['rotation'] > 0:
                 pi = 3.141592653589793
                 rot = str(self.config['rotation']*(pi/180))
@@ -729,6 +737,14 @@ class Timelapse:
 
             filters = list(orientation_filters)
 
+            # Determine rendered frame dimensions (portrait vs landscape)
+            if is_portrait:
+                width = min(raw_width, raw_height)
+                height = max(raw_width, raw_height)
+            else:
+                width = max(raw_width, raw_height)
+                height = min(raw_width, raw_height)
+
             # 2. Cinematic enhancements (Optimized pipeline)
             if cinematic_enabled:
                 # Exposure stabilization (deflicker) with size=5 buffer to prevent SWAP memory thrashing on 1GB RAM SBC
@@ -738,7 +754,6 @@ class Timelapse:
                 # Ken Burns Virtual Camera executed BEFORE framerate interpolation
                 # (Scales source frames at 10 FPS instead of 30 FPS, reducing CPU scaling work by 66%!)
                 if self.config.get('kenburns_enabled', False):
-                    width, height = self.get_frame_dimensions(filelist[0])
                     tx = max(0.0, min(100.0, float(self.config.get('kenburns_target_x', 50.0)))) / 100.0
                     ty = max(0.0, min(100.0, float(self.config.get('kenburns_target_y', 50.0)))) / 100.0
                     z_target = max(1.0, float(self.config.get('kenburns_zoom', 1.06)))

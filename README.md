@@ -6,29 +6,34 @@ A high-performance cinematic rendering extension for `moonraker-timelapse` that 
 
 ## Key Features
 
-1. **Duration-Preserving 30 FPS / 60 FPS Output**:
+1. **Native Portrait 9:16 Video Output for Social Media**:
+   - Supports vertically-mounted webcams (rotated 90° or 270°) and native 9:16 vertical video output (e.g. 720x1280 or 1080x1920).
+   - Designed specifically for TikTok, Instagram Reels, and YouTube Shorts.
+   - Rotates during the background FFmpeg post-processing pass with zero print-time CPU penalty, eliminating horizontal stretching or black side pillars.
+
+2. **Duration-Preserving 30 FPS / 60 FPS Output**:
    - Separates the source frame timeline rate (e.g. 10 FPS) from the video output framerate (e.g. 30 FPS or 60 FPS).
    - Generates smooth intermediate frames without shortening the final timelapse duration (`Duration = total_frames / source_timeline_fps`).
 
-2. **Ken Burns Virtual Camera Effect**:
+3. **Ken Burns Virtual Camera Effect**:
    - Adds smooth, continuous virtual camera zoom and pan across the entire timelapse.
    - Smooth Cosine Easing prevents sudden camera movements at the start or end.
    - Dynamic boundary calculation ensures zero black borders or empty frame margins.
 
-3. **Configurable Target Zoom Focus Position**:
+4. **Configurable Target Zoom Focus Position**:
    - `kenburns_target_x` (0% to 100%, default 50%): Horizontal zoom focus point.
    - `kenburns_target_y` (0% to 100%, default 50%): Vertical zoom focus point.
    - Allows zooming directly into off-center 3D prints on the print bed.
 
-4. **Cinematic Text Overlay (Layer, Real-Time Datetime & Filament Name)**:
+5. **Cinematic Text Overlay (Layer, Real-Time Datetime & Filament Name)**:
    - Overlays real-time frame layer number (`1 / 342`), local datetime (`YYYY-MM-DD HH:MM:SS`), and filament name (`SUNLU PETG`) onto the video.
    - Rendered in C inside RAM during the FFmpeg filtergraph pass — **0ms impact on toolhead pause duration & 0 MB extra RAM**.
    - Fully customizable overlay position (`bottom_right`, `bottom_left`, `top_right`, `top_left`) with semi-transparent dark translucent pill box.
 
-5. **Exposure Deflickering**:
+6. **Exposure Deflickering**:
    - Uses FFmpeg `deflicker` to remove frame-to-frame webcam brightness variations.
 
-6. **Resource-Isolated High-Performance Pipeline**:
+7. **Resource-Isolated High-Performance Pipeline**:
    - Single FFmpeg filtergraph: zero intermediate JPEGs saved to disk.
    - Optimized filter order (`zoompan` at 10 FPS source before upsampling) reduces CPU scaling workload by 66%.
    - Uses H.264 `superfast` encoder preset and bounded memory buffers (`size=5`) to prevent SWAP memory thrashing.
@@ -51,6 +56,15 @@ snapshoturl: http://localhost:1984/api/frame.jpeg?src=printer
 # - layermacro: Triggers snapshot via TIMELAPSE_TAKE_FRAME G-Code in Slicer
 # - hyperlapse: Triggers snapshot automatically at fixed time intervals (e.g. every 30s)
 mode: layermacro
+
+# ----------------------------------------------------------------------
+# Portrait 9:16 Social Media Rendering Options
+# ----------------------------------------------------------------------
+
+# Enable/disable native 9:16 vertical portrait video output for TikTok/Reels/Shorts
+# When True or when rotation is 90/270, the output video resolution is 9:16 portrait (e.g. 720x1280)
+# Range: True, False | Default: True
+portrait_mode: True
 
 # ----------------------------------------------------------------------
 # Cinematic Render Enhancement Options
