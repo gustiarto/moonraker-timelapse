@@ -112,21 +112,17 @@ cinematic_output_fps: 30
 ## Implementation & Architecture
 
 ### 1. Klipper Macro (`klipper_macro/timelapse.cfg`)
-- **`TIMELAPSE_TAKE_FRAME`**: When `park_dynamic_enabled` is active, queries `current_layer` and `total_layer` from Klipper `print_stats`.
-- Calculates progressive target Y position:
-  `target_y = y_min + (current_layer - 1) / (total_layers - 1) * (y_max - y_min)`
-- Clamps `target_y` safely within `[y_min, y_max]`.
-- Moves the toolhead/bed to the calculated position before taking the snapshot.
+- **`TIMELAPSE_TAKE_FRAME`**: Executes toolhead parking (if enabled) and triggers remote snapshot capture via `_TIMELAPSE_NEW_FRAME`.
+- **`TIMELAPSE_RENDER`**: Automatically called upon print completion to trigger background video generation.
+- **`_SET_TIMELAPSE_SETUP`**: Provides dynamic parameter configuration at runtime.
 
 ### 2. Moonraker Component (`component/timelapse.py`)
 - **`__init__(self, confighelper)`**:
-  Registers configuration defaults for cinematic rendering and dynamic bed parking.
+  Registers configuration defaults for cinematic rendering, native 9:16 portrait mode, Ken Burns virtual camera, and text overlays.
 - **`webrequest_settings(self, webrequest)`**:
   Handles API requests at `/machine/timelapse/settings` and persists settings to Moonraker DB.
-- **`setgcodevariables(self)`**:
-  Transmits dynamic parking parameters (`PARK_DYNAMIC_ENABLE`, `PARK_DYNAMIC_Y_MIN`, `PARK_DYNAMIC_Y_MAX`) to Klipper via `_SET_TIMELAPSE_SETUP`.
 - **`render(self, webrequest=None)`**:
-  Executes high-performance FFmpeg rendering pipeline with `nice -n 19`, `-threads 2`, `-preset superfast`, and fallback error handling.
+  Executes high-performance FFmpeg rendering pipeline with `nice -n 19`, `-threads 2`, `-preset superfast`, native portrait rotation handling, temporal frame interpolation, and fallback error handling.
 
 ---
 
